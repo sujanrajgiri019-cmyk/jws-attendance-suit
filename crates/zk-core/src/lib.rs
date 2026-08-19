@@ -11,7 +11,10 @@ pub mod db;
 pub mod proto;
 pub mod pull;
 pub mod push;
+pub mod reports;
 pub mod rules;
+pub mod ruleset;
+pub mod schedule;
 pub mod service;
 
 use thiserror::Error as ThisError;

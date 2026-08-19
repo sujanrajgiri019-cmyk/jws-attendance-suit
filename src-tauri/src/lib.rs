@@ -1,6 +1,8 @@
 //! JWS Attendance — application wiring.
 
 mod commands;
+mod reporting;
+mod scheduling;
 mod mailer;
 mod push_server;
 
@@ -167,6 +169,36 @@ pub fn run() {
             commands::list_backups,
             commands::open_path,
             commands::save_text_file,
+            // --- Attendance rules -------------------------------------------
+            scheduling::bs_calendar,
+            scheduling::get_attendance_rules,
+            scheduling::save_attendance_rules,
+            // --- Timetables, shifts, schedules ------------------------------
+            scheduling::list_timetables_full,
+            scheduling::save_timetable,
+            scheduling::delete_timetable,
+            scheduling::list_shift_cycles,
+            scheduling::save_shift,
+            scheduling::delete_shift,
+            scheduling::shift_grid,
+            scheduling::add_shift_item,
+            scheduling::delete_shift_item,
+            scheduling::clear_shift_grid,
+            scheduling::roster,
+            scheduling::save_schedule,
+            scheduling::delete_schedule,
+            scheduling::arrange_shifts,
+            scheduling::member_calendar,
+            scheduling::department_tree,
+            // --- Reports and delivery ---------------------------------------
+            reporting::report_kinds,
+            reporting::run_report,
+            reporting::export_report,
+            reporting::list_recipients,
+            reporting::save_recipient,
+            reporting::delete_recipient,
+            reporting::send_report_email,
+            reporting::report_mail_log,
         ])
         .run(tauri::generate_context!())
         .expect("JWS Attendance failed to start");

@@ -1,20 +1,71 @@
 import { api } from '../api.js';
 import {
-  icon, esc, table, statusTag, person, hhmm, duration, todayIso,
+  icon, esc, table, statusTag, person, hhmm, todayIso,
   barChart, donut, toast, withBusy, loadingTable, emptyState,
 } from '../ui.js';
+import { bsPretty, bsNepali, adPretty, nepaliDigits, ready as calReady } from '../nepali.js';
 
 const KPI = (label, value, iconName, colour, bg, detail) => `
   <div class="kpi" style="--c:${colour};--cb:${bg}">
     <div class="kh"><span class="kl">${esc(label)}</span>
       <span class="ki">${icon(iconName)}</span></div>
-    <div class="kv">${value}</div>
+    <div class="kv" data-count>${value}</div>
     <div class="kd">${detail}</div>
   </div>`;
 
+/**
+ * Count a figure up to its value.
+ *
+ * Purely decorative, and deliberately short: a number that takes a second to
+ * settle is a number the office cannot read at a glance. Anything non-numeric
+ * (a percentage with markup, a dash) is left exactly as it is.
+ */
+function animateCounts(root) {
+  if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return;
+  root.querySelectorAll('[data-count]').forEach((el) => {
+    const raw = el.textContent.trim();
+    const target = Number(raw);
+    if (!Number.isFinite(target) || target === 0 || raw !== String(target)) return;
+    const started = performance.now();
+    const step = (now) => {
+      const t = Math.min(1, (now - started) / 420);
+      // Ease-out, so it decelerates into the final value rather than stopping.
+      el.textContent = Math.round(target * (1 - (1 - t) ** 3));
+      if (t < 1) requestAnimationFrame(step);
+      else el.textContent = target;
+    };
+    el.textContent = '0';
+    requestAnimationFrame(step);
+  });
+}
+
 export default {
   async mount(host) {
+    const todayForHero = todayIso();
     host.innerHTML = `
+      <div class="hero" id="hero">
+        <div class="hero-l">
+          <img src="assets/logo-full.png" alt="Janapremi World School" class="hero-logo">
+          <div class="hero-t">
+            <h2>Janapremi World School</h2>
+            <p>Madhyapur Thimi–3, Kaushaltar, Bhaktapur</p>
+            <div class="hero-c">
+              <span>${icon('cpu')} 9744570500</span>
+              <span>${icon('cpu')} 9744570501</span>
+              <span>${icon('cpu')} 01-5910299</span>
+            </div>
+          </div>
+        </div>
+        <div class="hero-r">
+          <div class="hero-date">
+            <b id="heroBs">—</b>
+            <span id="heroAd">—</span>
+          </div>
+          <div class="hero-clock" id="heroClock">—</div>
+          <div class="hero-badge" id="heroBadge"></div>
+        </div>
+      </div>
+
       <div class="kpis" id="kpis"></div>
       <div class="g-2-1">
         <div class="card">
@@ -73,6 +124,28 @@ export default {
 
     const today = todayIso();
 
+    // --- the hero band -----------------------------------------------------
+    // Nepali date first, English underneath — the school runs on Bikram Sambat
+    // and reads the Gregorian date only to cross-check.
+    const paintHeroDate = () => {
+      const bs = calReady() ? bsNepali(today) : '';
+      host.querySelector('#heroBs').textContent = bs || bsPretty(today) || today;
+      host.querySelector('#heroAd').textContent =
+        `${bsPretty(today) || ''}${bsPretty(today) ? '  ·  ' : ''}${adPretty(today)}`;
+    };
+    paintHeroDate();
+
+    const heroClock = host.querySelector('#heroClock');
+    const tick = () => {
+      const n = new Date();
+      const hhmmss = n.toTimeString().slice(0, 8);
+      heroClock.innerHTML = calReady()
+        ? `${esc(nepaliDigits(hhmmss))}<i>${esc(hhmmss)}</i>`
+        : esc(hhmmss);
+    };
+    tick();
+    const clockTimer = setInterval(tick, 1000);
+
     const [stats, trend, depts, feed, attendance] = await Promise.all([
       api.dashboard(today),
       api.trend(14),
@@ -96,9 +169,18 @@ export default {
         `month so far <b>${stats.month_rate.toFixed(1)}%</b>`),
     ].join('');
 
+    host.querySelector('#heroBadge').innerHTML = stats.holiday_name
+      ? `<span class="hb hol">${icon('info')} ${esc(stats.holiday_name)}</span>`
+      : stats.is_working_day
+        ? `<span class="hb ok">${icon('check')} ${stats.present + stats.late} of ${stats.total_staff} marked in</span>`
+        : `<span class="hb off">${icon('clock')} Weekly holiday</span>`;
+
+    animateCounts(host.querySelector('#kpis'));
+
     // --- glance ---
-    host.querySelector('#glanceDate').textContent =
-      stats.holiday_name ? `${today} · ${stats.holiday_name}` : `${today}${stats.date_bs ? ` · ${stats.date_bs}` : ''}`;
+    host.querySelector('#glanceDate').innerHTML = stats.holiday_name
+      ? `${esc(bsPretty(today) || today)} · ${esc(stats.holiday_name)}`
+      : `${esc(bsPretty(today) || today)} <span class="ad">${esc(adPretty(today))}</span>`;
 
     host.querySelector('#donut').innerHTML = donut(
       [
@@ -154,7 +236,8 @@ export default {
             <span>${esc(p.dept_name || 'Unassigned')} · ${p.punch_state === 1 ? 'Check-out' : 'Check-in'}</span></div>
           <div style="text-align:right">
             <div class="tm">${esc(p.punch_time.slice(11, 16))}</div>
-            <span style="font-size:10.5px;color:var(--ink-4)">${esc(p.punch_time.slice(0, 10))}</span>
+            <span style="font-size:10.5px;color:var(--ink-4)">${
+              esc(bsPretty(p.punch_time.slice(0, 10)) || p.punch_time.slice(0, 10))}</span>
           </div>
         </div>`).join('');
     }
@@ -201,6 +284,10 @@ export default {
         if (r.errors?.length) r.errors.forEach((x) => toast('err', x));
       }).catch(() => {}),
     );
+
+    // Navigating away must stop the clock, or every visit to the dashboard
+    // leaves another timer running for the life of the session.
+    return () => clearInterval(clockTimer);
   },
 };
 

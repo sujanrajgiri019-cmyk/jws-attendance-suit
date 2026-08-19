@@ -75,13 +75,54 @@ export const api = {
   recompute: (from, to) => call('recompute', { from, to }),
   overrideAttendance: (p) => call('override_attendance', p),
 
-  listShifts: () => call('list_shifts'),
-  listTimetables: () => call('list_timetables'),
   listHolidays: () => call('list_holidays'),
   saveHoliday: (holiday) => call('save_holiday', { holiday }),
   deleteHoliday: (id) => call('delete_holiday', { id }),
-  setMemberTimetable: (memberId, timetableId) =>
-    call('set_member_timetable', { memberId, timetableId }),
+
+  // --- Timetables: the atomic blocks of duty ------------------------------
+  listTimetables: () => call('list_timetables_full'),
+  saveTimetable: (tt) => call('save_timetable', { tt }),
+  deleteTimetable: (id) => call('delete_timetable', { id }),
+
+  // --- Shifts: the repeating cycles ---------------------------------------
+  listShifts: () => call('list_shift_cycles'),
+  saveShift: (shift) => call('save_shift', { shift }),
+  deleteShift: (id) => call('delete_shift', { id }),
+  shiftGrid: (shiftId) => call('shift_grid', { shiftId }),
+  addShiftItem: (shiftId, dayIndex, timetableId) =>
+    call('add_shift_item', { shiftId, dayIndex, timetableId }),
+  deleteShiftItem: (id) => call('delete_shift_item', { id }),
+  clearShiftGrid: (shiftId) => call('clear_shift_grid', { shiftId }),
+
+  // --- Who works which shift ----------------------------------------------
+  departmentTree: () => call('department_tree'),
+  roster: (deptId) => call('roster', { deptId: deptId ?? null }),
+  saveSchedule: (row) => call('save_schedule', { row }),
+  deleteSchedule: (id) => call('delete_schedule', { id }),
+  arrangeShifts: (memberIds, shiftId, startDate, endDate, isTemporary) =>
+    call('arrange_shifts', {
+      memberIds, shiftId, startDate, endDate: endDate || null, isTemporary: !!isTemporary,
+    }),
+  memberCalendar: (memberId, from, to) => call('member_calendar', { memberId, from, to }),
+
+  // --- The Nepali calendar -------------------------------------------------
+  bsCalendar: () => call('bs_calendar'),
+
+  // --- Attendance rules ----------------------------------------------------
+  getAttendanceRules: () => call('get_attendance_rules'),
+  saveAttendanceRules: (rules) => call('save_attendance_rules', { rules }),
+
+  // --- Reports -------------------------------------------------------------
+  reportKinds: () => call('report_kinds'),
+  runReport: (key, filters) => call('run_report', { key, filters }),
+  exportReport: (key, filters, format, path) =>
+    call('export_report', { key, filters, format, path }),
+  listRecipients: () => call('list_recipients'),
+  saveRecipient: (r) => call('save_recipient', { r }),
+  deleteRecipient: (id) => call('delete_recipient', { id }),
+  sendReportEmail: (key, filters, recipientIds, note) =>
+    call('send_report_email', { key, filters, recipientIds, note: note || null }),
+  reportMailLog: (limit = 25) => call('report_mail_log', { limit }),
 
   getRules: () => call('get_rules'),
   setRules: (rules) => call('set_rules', { rules }),

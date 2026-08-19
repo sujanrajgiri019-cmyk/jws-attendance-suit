@@ -2,6 +2,8 @@
 
 import { api, isDesktop, listen } from './api.js';
 import { icon, toast, esc, modal, withBusy } from './ui.js';
+import { notify, togglePanel } from './notifications.js';
+import { initCalendar, bsNepali, bsPretty, adPretty, nepaliDigits, ready as calReady } from './nepali.js';
 
 import dashboard from './pages/dashboard.js';
 import devices from './pages/devices.js';
@@ -93,12 +95,16 @@ export async function go(id) {
 function clock() {
   const tick = () => {
     const now = new Date();
-    document.getElementById('clkTime').textContent = now.toTimeString().slice(0, 8);
+    const t = now.toTimeString().slice(0, 8);
+    document.getElementById('clkTime').textContent = calReady() ? nepaliDigits(t) : t;
+    // Nepali first: this is a Nepali school, and the English date is the one
+    // people cross-check against, not the one they work from.
+    const iso = now.toISOString().slice(0, 10);
+    const bs = calReady() ? bsPretty(iso) : (state.info?.today_bs || '');
     const ad = now.toLocaleDateString('en-GB', {
-      weekday: 'short', day: 'numeric', month: 'short', year: 'numeric',
+      weekday: 'short', day: 'numeric', month: 'short',
     });
-    const bs = state.info?.today_bs ? ` · ${state.info.today_bs}` : '';
-    document.getElementById('clkDate').textContent = ad + bs;
+    document.getElementById('clkDate').textContent = bs ? `${bs} · ${ad}` : ad;
   };
   tick();
   setInterval(tick, 1000);
@@ -245,6 +251,13 @@ export async function forgotPasswordFlow() {
 
 async function start() {
   buildNav();
+  // The Nepali calendar is loaded before the first screen paints, so no date
+  // ever appears in Gregorian first and then flips.
+  try {
+    await initCalendar(api);
+  } catch (e) {
+    console.warn('Nepali calendar unavailable:', e);
+  }
   await loadInfo();
   clock();
   await refreshDeviceChip();
@@ -254,6 +267,14 @@ async function start() {
     const a = e.target.closest('a[data-page]');
     if (a) go(a.dataset.page);
   });
+
+  // In a browser there is no backend to emit punch events, so expose the
+  // notifier for the end-to-end suite to drive. Never in the installed app.
+  if (!isDesktop()) window.__jwsNotify = notify;
+
+  const bell = document.getElementById('btnBell');
+  document.getElementById('bellIcon').innerHTML = icon('bell');
+  bell.addEventListener('click', togglePanel);
 
   const refresh = document.getElementById('btnRefresh');
   refresh.innerHTML = icon('sync');
@@ -287,13 +308,23 @@ async function start() {
     }
   });
 
-  // Live punches: refresh the dashboard if that is what is on screen.
+  // Live punches go to the notification tray, not the screen. Forty people
+  // arriving at the gate should not bury whatever the office is doing.
+  let punchRedraw = null;
   listen('punch', (p) => {
-    toast('inf', `${p.full_name || `Enrolment ${p.enroll_no}`} · ${p.punch_time.slice(11, 16)}`);
-    if (state.current === 'dashboard') go('dashboard');
+    const who = p.full_name || `Enrolment ${p.enroll_no}`;
+    const dir = p.punch_state === 1 ? 'checked out' : 'checked in';
+    notify('punch', `${who} ${dir}`, p.punch_time.slice(11, 16));
+
+    // A rush at the gate would otherwise re-render the dashboard dozens of
+    // times a second; collapse it into one redraw.
+    if (state.current === 'dashboard') {
+      clearTimeout(punchRedraw);
+      punchRedraw = setTimeout(() => go('dashboard'), 1500);
+    }
   });
   listen('device-online', (serial) => {
-    toast('ok', `Terminal ${serial} connected`);
+    notify('device', 'Terminal connected', serial);
     refreshDeviceChip();
   });
 

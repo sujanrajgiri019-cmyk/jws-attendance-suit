@@ -7,6 +7,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 // esbuild is not involved here; the helpers are plain ES modules.
 const ui = await import('../src/js/ui.js');
@@ -114,4 +119,128 @@ test('bar chart does not divide by zero when every value is zero', () => {
   const svg = ui.barChart([{ date: '2026-08-19', present: 0, late: 0, absent: 0 }]);
   assert.ok(!svg.includes('NaN'));
   assert.ok(!svg.includes('Infinity'));
+});
+
+// ---------------------------------------------------------------------------
+// The Nepali calendar
+// ---------------------------------------------------------------------------
+
+test('the generated Nepali table matches the Rust source it came from', async () => {
+  const { BS_TABLE } = await import('../src/js/bs-table.generated.js');
+  const rs = await fs.readFile(
+    path.join(root, 'crates', 'zk-core', 'src', 'calendar.rs'), 'utf8');
+
+  assert.equal(BS_TABLE.min_year, 2000);
+  assert.equal(BS_TABLE.max_year, 2090);
+  assert.equal(BS_TABLE.months.length, 91);
+
+  // Spot-check a row against the file, so a mangled regex cannot pass silently.
+  const line2083 = /\[([0-9,\s]+)\],\s*\/\/ 2083/.exec(rs);
+  assert.ok(line2083, '2083 not found in calendar.rs');
+  const expected = line2083[1].split(',').map((n) => Number(n.trim())).filter(Boolean);
+  assert.deepEqual(BS_TABLE.months[2083 - 2000], expected);
+
+  for (const [i, row] of BS_TABLE.months.entries()) {
+    assert.equal(row.length, 12, `year ${2000 + i} does not have twelve months`);
+    for (const len of row) {
+      assert.ok(len >= 29 && len <= 32, `impossible month length ${len} in ${2000 + i}`);
+    }
+  }
+});
+
+test('Nepali conversion round-trips and agrees with the published reference', async () => {
+  const np = await import('../src/js/nepali.js');
+  const { BS_TABLE } = await import('../src/js/bs-table.generated.js');
+  await np.initCalendar({ bsCalendar: async () => BS_TABLE });
+
+  // Hamro Patro: 19 August 2026 is 3 Bhadra 2083.
+  const b = np.toBs('2026-08-19');
+  assert.deepEqual(b, { year: 2083, month: 5, day: 3 });
+  assert.equal(np.bsPretty('2026-08-19'), '3 Bhadra 2083');
+  assert.equal(np.toAd(2083, 5, 3), '2026-08-19');
+
+  // Every month boundary in a decade must survive both conversions.
+  for (let y = 2078; y <= 2088; y++) {
+    for (let m = 1; m <= 12; m++) {
+      const last = np.daysInBsMonth(y, m);
+      for (const d of [1, last]) {
+        const iso = np.toAd(y, m, d);
+        assert.ok(iso, `${y}-${m}-${d} did not convert`);
+        assert.deepEqual(np.toBs(iso), { year: y, month: m, day: d }, `${y}-${m}-${d}`);
+      }
+    }
+  }
+});
+
+test('Nepali conversion refuses dates it cannot vouch for', async () => {
+  const np = await import('../src/js/nepali.js');
+  const { BS_TABLE } = await import('../src/js/bs-table.generated.js');
+  await np.initCalendar({ bsCalendar: async () => BS_TABLE });
+
+  // Before the table's anchor, and after its last year.
+  assert.equal(np.toBs('1900-01-01'), null);
+  assert.equal(np.toAd(1999, 1, 1), null);
+  assert.equal(np.toAd(2091, 1, 1), null);
+  // A day that does not exist in that month.
+  assert.equal(np.toAd(2083, 5, 33), null);
+  assert.equal(np.toAd(2083, 13, 1), null);
+  // Rubbish in must not produce a confident answer.
+  assert.equal(np.toBs(''), null);
+  assert.equal(np.toBs('not a date'), null);
+});
+
+test('Nepali digits and both-calendar formatting', async () => {
+  const np = await import('../src/js/nepali.js');
+  const { BS_TABLE } = await import('../src/js/bs-table.generated.js');
+  await np.initCalendar({ bsCalendar: async () => BS_TABLE });
+
+  assert.equal(np.nepaliDigits('2083'), '२०८३');
+  assert.equal(np.nepaliDigits(3), '३');
+  assert.equal(np.bsNepali('2026-08-19'), '३ Bhadra २०८३');
+  assert.equal(np.bsIso('2026-08-19'), '2083-05-03');
+  assert.equal(np.adPretty('2026-08-19'), '19 Aug 2026');
+  // Both together, with the English date marked up as the secondary line.
+  assert.match(np.bothPretty('2026-08-19'), /3 Bhadra 2083.*class="ad".*19 Aug 2026/);
+});
+
+test('a Nepali date field carries the Gregorian value the backend expects', async () => {
+  const np = await import('../src/js/nepali.js');
+  const { BS_TABLE } = await import('../src/js/bs-table.generated.js');
+  await np.initCalendar({ bsCalendar: async () => BS_TABLE });
+
+  const html = np.dateField('from', 'From', '2026-08-19');
+  // What the user reads is Nepali; what is submitted stays ISO Gregorian, so
+  // every screen and query that already reads this field keeps working.
+  assert.match(html, /3 Bhadra 2083/);
+  assert.match(html, /19 Aug 2026/);
+  assert.match(html, /<input type="hidden" name="from"[^>]*value="2026-08-19"/);
+});
+
+test('the stepper does not reuse the busy spinner class name', async () => {
+  // `.spin` is the rotating busy indicator on a button. A stepper that shares
+  // the class inherits `animation: rot ... infinite` and every number field on
+  // the rules screen turns on its own axis — which is exactly what shipped
+  // once and is the kind of thing nobody thinks to look for in CSS.
+  const css = await fs.readFile(path.join(root, 'src', 'styles.css'), 'utf8');
+  const rules = await fs.readFile(path.join(root, 'src', 'js', 'pages', 'rules.js'), 'utf8');
+
+  assert.ok(!/class="spin"/.test(rules), 'rules.js still uses the spinner class');
+  assert.ok(/class="stepper"/.test(rules), 'the stepper markup is missing');
+
+  // Whatever carries an infinite animation must not also be a layout class.
+  const spinBlock = /\n\.spin\{([^}]*)\}/.exec(css);
+  assert.ok(spinBlock, '.spin rule not found');
+  assert.match(spinBlock[1], /animation:\s*rot/, '.spin should be the busy indicator');
+  assert.ok(!/display:\s*flex/.test(spinBlock[1]), '.spin must not double as a layout container');
+});
+
+test('the header clock is pinned to a fixed width', async () => {
+  // Nepali numerals are not tabular, so a clock ticking in Devanagari changes
+  // width every second. In a flex header that reflows the row and makes the
+  // date beside it wrap and unwrap, shifting the whole page once a second.
+  const css = await fs.readFile(path.join(root, 'src', 'styles.css'), 'utf8');
+  const clock = [...css.matchAll(/\n\.clock\{([^}]*)\}/g)].at(-1);
+  assert.ok(clock, '.clock rule not found');
+  assert.match(clock[1], /min-width/, 'the clock needs a floor on its width');
+  assert.match(css, /\.clock b\{[^}]*white-space:nowrap/, 'the time must not wrap');
 });

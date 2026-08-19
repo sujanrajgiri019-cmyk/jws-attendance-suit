@@ -1,152 +1,390 @@
-import { api } from '../api.js';
-import { icon, esc, table, toast, withBusy, todayIso, monthStart } from '../ui.js';
+// Data Transfer — everything that moves between the terminal and this PC.
+//
+// Laid out as a console rather than a form: an action list on the left, a live
+// status bar across the top, and a scrolling log of what actually happened.
+// Transfers take tens of seconds and sometimes fail halfway; a spinner that
+// says nothing is what makes an office restart the app mid-sync.
+
+import { api, listen } from '../api.js';
+import { icon, esc, toast, table, todayIso, monthStart, confirmDialog } from '../ui.js';
+import { dateField, wireDateFields, bsPretty } from '../nepali.js';
+
+const ACTIONS = [
+  { id: 'logs', label: 'Download attendance logs', icon: 'down' },
+  { id: 'users_down', label: 'Download user info and FP', icon: 'users' },
+  { id: 'users_up', label: 'Upload user info and FP', icon: 'up' },
+  { id: 'photos', label: 'Attendance photo management', icon: 'file' },
+  { id: 'ac', label: 'AC manage', icon: 'lock' },
+  { id: 'recompute', label: 'Recalculate attendance', icon: 'sync' },
+];
 
 export default {
   async mount(host) {
-    const [devices, depts, members] = await Promise.all([
-      api.listDevices(), api.listDepartments(), api.listMembers(),
+    const [devices, members, depts] = await Promise.all([
+      api.listDevices(), api.listMembers(), api.listDepartments(),
     ]);
 
-    const devOptions = devices.length
-      ? devices.map((d) => `<option value="${d.id}">${esc(d.name)} — ${esc(d.ip)}</option>`).join('')
-      : '<option value="">No terminal registered</option>';
-
-    const active = members.filter((m) => m.status === 'Active');
+    let action = 'logs';
+    let device = devices[0] || null;
+    const log = [];
 
     host.innerHTML = `
-      ${devices.length ? '' : `<div class="note y" style="margin-bottom:14px">${icon('warn')}<div>
-        No terminal is registered yet. Add one on the <b>Devices</b> screen before transferring anything.
-      </div></div>`}
+      <div class="card">
+        <div class="toolbar wrap">
+          <div class="tb-f"><label>Terminal</label>
+            <select class="inp sm" id="dvPick">
+              ${devices.map((d) => `<option value="${d.id}">${esc(d.name)} · ${esc(d.ip)}</option>`).join('')}
+              ${devices.length ? '' : '<option value="">No terminal registered</option>'}
+            </select></div>
+          <div class="dev-chip" id="dvState"><span class="d"></span><span id="dvText">Not checked</span></div>
+          <button class="btn sm" id="dvTest">${icon('plug')} Test connection</button>
+          <span class="grow"></span>
+          <div id="dvGauges" style="min-width:260px"></div>
+        </div>
+      </div>
 
-      <div class="g3">
-        <div class="card">
-          <div class="card-h"><div class="ico">${icon('up')}</div>
-            <div class="ht"><h3>Send Users to Terminal</h3><p>This computer → device</p></div></div>
-          <div class="card-b">
-            <p style="font-size:12.5px;color:var(--ink-2);margin-bottom:13px">
-              Queue staff records so the terminal knows who each enrolment number belongs to.
-            </p>
-            <div class="fld"><label>Scope</label>
-              <label class="cb" style="margin-bottom:8px">
-                <input type="radio" name="scope" value="all" checked>
-                <div class="ct"><b>All active members</b><span>${active.length} currently active</span></div></label>
-              <label class="cb" style="margin-bottom:8px">
-                <input type="radio" name="scope" value="dept">
-                <div class="ct"><b>One department</b><span>Only staff in the chosen group</span></div></label>
-              <label class="cb">
-                <input type="radio" name="scope" value="pick">
-                <div class="ct"><b>Chosen members</b><span>Hand-pick from the list</span></div></label>
-            </div>
-            <div id="scopeExtra"></div>
-            <button class="btn pri" style="width:100%" id="btnUpload">${icon('up')} Queue upload</button>
-            <div class="hint" style="margin-top:8px">
-              The terminal collects queued changes on its next check-in, usually within a minute.
-            </div>
+      <div class="split mt14">
+        <div class="card pane-l">
+          <div class="card-h"><div class="ht"><h3>Actions</h3><p>Pick a job</p></div></div>
+          <div class="actions-nav" id="actNav">
+            ${ACTIONS.map((a) => `
+              <button data-act="${a.id}">${icon(a.icon)}<span>${esc(a.label)}</span></button>`).join('')}
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-h"><div class="ico b">${icon('down')}</div>
-            <div class="ht"><h3>Read Users from Terminal</h3><p>Device → this computer</p></div></div>
-          <div class="card-b">
-            <p style="font-size:12.5px;color:var(--ink-2);margin-bottom:13px">
-              Pick up anyone enrolled directly on the terminal keypad and add them here.
-            </p>
-            <div class="fld"><label>Terminal</label>
-              <select class="inp" id="dnDev">${devOptions}</select></div>
-            <div class="note b" style="margin-bottom:14px">${icon('info')}<div>
-              Existing records are never overwritten — only new enrolment numbers are added.
-            </div></div>
-            <button class="btn" style="width:100%" id="btnDownUsers">${icon('down')} Read users</button>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-h"><div class="ico g">${icon('sync')}</div>
-            <div class="ht"><h3>Fetch Punch Records</h3><p>Catch up on missed scans</p></div></div>
-          <div class="card-b">
-            <p style="font-size:12.5px;color:var(--ink-2);margin-bottom:13px">
-              Pull everything the terminal has stored. Safe to run at any time —
-              records already held are skipped.
-            </p>
-            <div class="fld"><label>Terminal</label>
-              <select class="inp" id="lgDev">${devOptions}</select></div>
-            <div class="fld">
-              <label class="cb"><input type="checkbox" id="clearAfter">
-                <div class="ct"><b>Clear the terminal log afterwards</b>
-                  <span>Frees memory on the device. Only happens if the transfer succeeds, but it cannot be undone.</span></div>
-              </label></div>
-            <button class="btn ok" style="width:100%" id="btnLogs">${icon('sync')} Fetch records</button>
+        <div class="card pane-r">
+          <div class="card-b" id="actBody"></div>
+          <div class="card-b" style="border-top:1px solid var(--line)">
+            <div class="form-head" style="margin-bottom:10px;padding-bottom:9px">
+              <h3>Console</h3>
+              <div class="fh-b">
+                <button class="btn sm" id="logClear">Clear</button>
+              </div>
+            </div>
+            <div class="progress" id="prog" hidden><i style="width:0%"></i></div>
+            <div class="console" id="console"></div>
           </div>
         </div>
       </div>
 
-      <div class="g2 mt14">
-        <div class="card">
-          <div class="card-h"><div class="ht"><h3>Recalculate Attendance</h3>
-            <p>Rebuild daily records from the raw scans</p></div></div>
-          <div class="card-b">
-            <p style="font-size:12.5px;color:var(--ink-2);margin-bottom:14px">
-              Run this after changing shifts, timetables, holidays or attendance rules.
-              Days an administrator corrected by hand, and any locked month, are left untouched.
-            </p>
-            <div class="grid2">
-              <div class="fld"><label>From</label>
-                <input type="date" class="inp" id="recFrom" value="${monthStart(todayIso())}"></div>
-              <div class="fld"><label>To</label>
-                <input type="date" class="inp" id="recTo" value="${todayIso()}"></div>
-            </div>
-            <button class="btn pri" id="btnRecompute">${icon('sync')} Recalculate</button>
-          </div>
-        </div>
-
-        <div class="card">
-          <div class="card-h"><div class="ht"><h3>Transfer History</h3><p>Most recent jobs</p></div></div>
-          <div class="tbl-wrap"><table class="tbl" id="hist"></table></div>
-        </div>
+      <div class="card mt14">
+        <div class="card-h"><div class="ht"><h3>Transfer history</h3><p>Recent jobs</p></div></div>
+        <div class="tbl-wrap"><table class="tbl" id="hist"></table></div>
       </div>`;
 
-    // --- scope picker ---
-    const extra = host.querySelector('#scopeExtra');
-    const scopeInputs = host.querySelectorAll('[name=scope]');
-    const renderScope = () => {
-      const v = [...scopeInputs].find((r) => r.checked)?.value;
-      if (v === 'dept') {
-        extra.innerHTML = `<div class="fld"><label>Department</label>
-          <select class="inp" id="scopeDept">
-            ${depts.map((d) => `<option value="${d.id}">${esc(d.name)} (${d.member_count})</option>`).join('')}
-          </select></div>`;
-      } else if (v === 'pick') {
-        extra.innerHTML = `<div class="fld"><label>Members</label>
-          <div style="max-height:190px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:10px">
-            ${members.map((m) => `<label class="cb" style="margin-bottom:7px">
-              <input type="checkbox" data-mid="${m.id}">
-              <div class="ct"><b>${esc(m.full_name)}</b>
-                <span>Enrolment ${m.enroll_no} · ${esc(m.dept_name || 'Unassigned')}</span></div></label>`).join('')}
+    const consoleEl = host.querySelector('#console');
+    const body = host.querySelector('#actBody');
+    const prog = host.querySelector('#prog');
+
+    /** Write one timestamped line to the console. */
+    function say(level, message) {
+      const ts = new Date().toTimeString().slice(0, 8);
+      log.push({ ts, level, message });
+      // Only the last few hundred lines are worth keeping in the DOM.
+      if (log.length > 400) log.shift();
+      consoleEl.innerHTML = log.map((l) =>
+        `<div class="ln"><span class="ts">${esc(l.ts)}</span><span class="${l.level}">${esc(l.message)}</span></div>`).join('');
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    }
+
+    const progress = (percent) => {
+      prog.hidden = percent === null;
+      if (percent !== null) prog.querySelector('i').style.width = `${percent}%`;
+    };
+
+    /** Run a job with console framing, so every action reports the same way. */
+    async function job(name, fn) {
+      if (!device && name !== 'Recalculate attendance') {
+        say('error', 'No terminal is selected.');
+        toast('err', 'Register a terminal on the Devices screen first.');
+        return;
+      }
+      say('info', `${name}: starting…`);
+      progress(15);
+      try {
+        const msg = await fn();
+        progress(100);
+        say('ok', `${name}: ${msg}`);
+        toast('ok', msg);
+        await loadHistory();
+      } catch (e) {
+        progress(null);
+        say('error', `${name} failed — ${e.message || e}`);
+        toast('err', e.message || String(e));
+        return;
+      }
+      setTimeout(() => progress(null), 700);
+    }
+
+    // --- device status ------------------------------------------------------
+
+    async function testDevice() {
+      const chip = host.querySelector('#dvState');
+      const text = host.querySelector('#dvText');
+      if (!device) {
+        chip.classList.add('off');
+        text.textContent = 'No terminal registered';
+        return;
+      }
+      text.textContent = 'Checking…';
+      try {
+        const ms = await api.devicePing(device.ip, device.port);
+        chip.classList.remove('off');
+        text.textContent = `Connected · ${device.ip}:${device.port} · ${ms} ms`;
+        say('ok', `${device.name} answered in ${ms} ms`);
+        await loadGauges();
+      } catch (e) {
+        chip.classList.add('off');
+        text.textContent = `Offline · ${device.ip}:${device.port}`;
+        say('warn', `${device.name} did not answer: ${e.message || e}`);
+      }
+    }
+
+    /** Memory gauges, when the terminal will tell us. */
+    async function loadGauges() {
+      const el = host.querySelector('#dvGauges');
+      if (!device) return (el.innerHTML = '');
+      try {
+        const info = await api.deviceInfo(device.ip, device.port, device.comm_key || 0);
+        // The K40 Pro reports its own capacities; where it does not, show the
+        // count alone rather than inventing a denominator.
+        const bar = (label, used, cap, colour) => {
+          const p = cap ? Math.min(100, (used / cap) * 100) : 0;
+          return `<div class="gauge">
+            <div class="gauge-t"><b>${esc(label)}</b>
+              <span>${used}${cap ? ` / ${cap}` : ''}${cap ? ` · ${Math.round(p)}%` : ''}</span></div>
+            <div class="gauge-b"><i style="width:${p}%;background:${
+              p > 85 ? 'var(--bad)' : p > 60 ? 'var(--warn)' : colour}"></i></div>
+          </div>`;
+        };
+        el.innerHTML =
+          bar('Users', info.user_count, 1000, 'var(--brand)') +
+          bar('Log capacity', info.log_count, 100000, 'var(--good)');
+        say('info', `${info.name || 'Terminal'} · firmware ${info.platform || '—'} · serial ${info.serial || '—'}`);
+      } catch {
+        el.innerHTML = '<span class="hint">Memory figures need a direct TCP connection.</span>';
+      }
+    }
+
+    // --- the action panes ---------------------------------------------------
+
+    const devOptions = () =>
+      devices.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join('');
+
+    function paintAction() {
+      host.querySelectorAll('#actNav button').forEach((b) =>
+        b.classList.toggle('on', b.dataset.act === action));
+
+      if (action === 'logs') {
+        body.innerHTML = `
+          <div class="form-head"><h3>Download attendance logs</h3></div>
+          <p class="hint mb8">Pull everything the terminal has stored. Records already held
+            are skipped, so this is safe to run at any time.</p>
+          <div class="note b" id="modeNote">${icon('info')}<div></div></div>
+          <label class="cb"><input type="checkbox" id="clearAfter">
+            <div class="ct"><b>Clear the terminal log afterwards</b>
+              <span>Frees memory on the device. Only happens if the transfer succeeds,
+                and it cannot be undone.</span></div></label>
+          <button class="btn pri" id="go">${icon('down')} Download logs</button>`;
+        paintModeNote();
+        return;
+      }
+
+      if (action === 'users_down') {
+        body.innerHTML = `
+          <div class="form-head"><h3>Download user info and fingerprints</h3></div>
+          <p class="hint mb8">Picks up anyone enrolled directly on the terminal keypad and
+            adds them here. Existing records are never overwritten — only new
+            enrolment numbers are added.</p>
+          <div class="note b" id="modeNote">${icon('info')}<div></div></div>
+          <button class="btn pri" id="go">${icon('users')} Read users from terminal</button>`;
+        paintModeNote();
+        return;
+      }
+
+      if (action === 'users_up') {
+        body.innerHTML = `
+          <div class="form-head"><h3>Upload user info and fingerprints</h3></div>
+          <p class="hint mb8">Push names, privileges and card numbers to the terminal.</p>
+          <div class="fld"><label>Who to send</label>
+            <div class="radios">
+              <label class="rd"><input type="radio" name="scope" value="all" checked><span>Everyone</span></label>
+              <label class="rd"><input type="radio" name="scope" value="dept"><span>One department</span></label>
+              <label class="rd"><input type="radio" name="scope" value="pick"><span>Choose people</span></label>
+            </div></div>
+          <div id="scopeExtra"></div>
+          <button class="btn pri" id="go">${icon('up')} Upload to terminal</button>`;
+        wireScope();
+        return;
+      }
+
+      if (action === 'photos') {
+        body.innerHTML = `
+          <div class="form-head"><h3>Attendance photo management</h3></div>
+          <div class="note y">${icon('warn')}<div>
+            <b>The K40 Pro does not capture attendance photos.</b><br>
+            This screen is here for a terminal that does. Photos would be stored
+            beside the database rather than inside it — a year of captures is
+            several gigabytes, and that does not belong in a file the office
+            copies to a memory stick.
+          </div></div>
+          <button class="btn" id="go" disabled>${icon('file')} Download photos</button>`;
+        return;
+      }
+
+      if (action === 'ac') {
+        body.innerHTML = `
+          <div class="form-head"><h3>Access control</h3></div>
+          <p class="hint mb8">Time zones say when the door relay may open; a group binds up
+            to three of them and is what each member of staff belongs to.</p>
+          <div class="note b">${icon('info')}<div>
+            Two time zones and two groups are set up: <b>Always open</b> and
+            <b>School hours</b> (06:00–19:00, closed Saturday). Members are in
+            group 1 unless changed on their record.
+          </div></div>
+          <div class="note y">${icon('warn')}<div>
+            Pushing access rules to the relay is not enabled in this version. The
+            definitions are stored and will be sent once the door hardware is
+            wired to the terminal.
           </div></div>`;
-      } else {
-        extra.innerHTML = '';
+        return;
       }
-    };
-    scopeInputs.forEach((r) => r.addEventListener('change', renderScope));
-    renderScope();
 
-    const chosenIds = () => {
-      const v = [...scopeInputs].find((r) => r.checked)?.value;
-      if (v === 'all') return active.map((m) => m.id);
+      paintModeNote();
+      body.innerHTML = `
+        <div class="form-head"><h3>Recalculate attendance</h3></div>
+        <p class="hint mb8">Run this after changing shifts, timetables, holidays or rules.
+          Days an administrator corrected by hand, and any locked month, are left untouched.</p>
+        <div class="grid2">
+          ${dateField('recFrom', 'From', monthStart(todayIso()), { id: 'recFrom' })}
+          ${dateField('recTo', 'To', todayIso(), { id: 'recTo' })}
+        </div>
+        <button class="btn pri" id="go">${icon('sync')} Recalculate</button>`;
+    }
+
+    /** Say which way round this terminal talks, because it changes what happens. */
+    function paintModeNote() {
+      const note = body.querySelector('#modeNote div');
+      if (!note) return;
+      note.innerHTML = device?.mode === 'push'
+        ? `<b>${esc(device.name)} is in push mode.</b> It sends to this PC rather than
+           being dialled, so this asks the terminal to send and the data arrives on its
+           next check-in — usually within a minute. Watch the console below.`
+        : 'This dials the terminal directly on port 4370. A full terminal takes up to a '
+          + 'minute; the app stays usable while it works.';
+    }
+
+    function wireScope() {
+      const extra = body.querySelector('#scopeExtra');
+      const paint = () => {
+        const v = [...body.querySelectorAll('[name=scope]')].find((r) => r.checked)?.value;
+        if (v === 'dept') {
+          extra.innerHTML = `<div class="fld"><label>Department</label>
+            <select class="inp" id="scopeDept">
+              ${depts.map((d) => `<option value="${d.id}">${esc(d.name)} (${d.member_count})</option>`).join('')}
+            </select></div>`;
+        } else if (v === 'pick') {
+          extra.innerHTML = `<div class="fld"><label>Members</label>
+            <div class="picklist">
+              ${members.map((m) => `<label class="cb">
+                <input type="checkbox" data-mid="${m.id}">
+                <div class="ct"><b>${esc(m.full_name)}</b>
+                  <span>Enrolment ${m.enroll_no} · ${esc(m.dept_name || 'Unassigned')}</span></div>
+              </label>`).join('')}
+            </div></div>`;
+        } else {
+          extra.innerHTML = '';
+        }
+      };
+      body.querySelectorAll('[name=scope]').forEach((r) => r.addEventListener('change', paint));
+      paint();
+    }
+
+    function chosenIds() {
+      const v = [...body.querySelectorAll('[name=scope]')].find((r) => r.checked)?.value;
+      if (v === 'all') return members.map((m) => m.id);
       if (v === 'dept') {
-        const id = Number(host.querySelector('#scopeDept').value);
-        return members.filter((m) => m.dept_id === id).map((m) => m.id);
+        const d = Number(body.querySelector('#scopeDept')?.value);
+        return members.filter((m) => m.dept_id === d).map((m) => m.id);
       }
-      return [...host.querySelectorAll('[data-mid]:checked')].map((c) => Number(c.dataset.mid));
-    };
+      return [...body.querySelectorAll('[data-mid]:checked')].map((c) => Number(c.dataset.mid));
+    }
 
-    const deviceById = (sel) => devices.find((d) => d.id === Number(host.querySelector(sel).value));
+    // --- wiring -------------------------------------------------------------
+
+    host.querySelector('#actNav').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-act]');
+      if (!b) return;
+      action = b.dataset.act;
+      paintAction();
+    });
+
+    host.querySelector('#dvPick').addEventListener('change', (e) => {
+      device = devices.find((d) => String(d.id) === e.target.value) || null;
+      testDevice();
+    });
+    host.querySelector('#dvTest').addEventListener('click', testDevice);
+    host.querySelector('#logClear').addEventListener('click', () => {
+      log.length = 0;
+      consoleEl.innerHTML = '';
+    });
+
+    body.addEventListener('click', async (e) => {
+      if (!e.target.closest('#go')) return;
+      const btn = e.target.closest('#go');
+      btn.disabled = true;
+      try {
+        if (action === 'logs') {
+          const clear = body.querySelector('#clearAfter')?.checked;
+          if (clear && !(await confirmDialog('Clear the terminal after downloading?',
+            'The device log will be erased once the records are safely stored here. This cannot be undone.',
+            'Download and clear'))) return;
+          await job('Download attendance logs', async () => {
+            const r = await api.downloadLogs(
+              device.ip, device.port, device.comm_key || 0, device.serial || '', !!clear);
+            if (device.mode === 'push') {
+              return 'Requested from the terminal — records arrive on its next check-in';
+            }
+            return `${r.fetched} records read, ${r.accepted} new, ${r.duplicates} already held`;
+          });
+        } else if (action === 'users_down') {
+          await job('Download users', async () => {
+            const n = await api.downloadUsers(device.ip, device.port, device.comm_key || 0);
+            // A push-mode terminal is asked rather than dialled, so nothing has
+            // arrived yet. Saying "0 users" would read as a failure.
+            if (device.mode === 'push') {
+              return 'Requested from the terminal — the list arrives on its next check-in';
+            }
+            return n ? `${n} new user${n === 1 ? '' : 's'} added` : 'No new users on the terminal';
+          });
+        } else if (action === 'users_up') {
+          const ids = chosenIds();
+          if (!ids.length) throw new Error('Nobody is selected.');
+          await job('Upload users', async () => {
+            const n = await api.uploadUsers(ids);
+            return `${n} update${n === 1 ? '' : 's'} queued for the terminal`;
+          });
+        } else if (action === 'recompute') {
+          const from = body.querySelector('#recFrom').value;
+          const to = body.querySelector('#recTo').value;
+          if (!from || !to) throw new Error('Choose both a start and an end date.');
+          await job('Recalculate attendance', async () => {
+            const n = await api.recompute(from, to);
+            return `${n} day record${n === 1 ? '' : 's'} rebuilt`;
+          });
+        }
+      } catch (err) {
+        say('error', err.message || String(err));
+        toast('err', err.message || String(err));
+      } finally {
+        btn.disabled = false;
+      }
+    });
 
     async function loadHistory() {
-      const rows = await api.syncHistory(10);
+      const rows = await api.syncHistory(15);
       table(host.querySelector('#hist'), [
-        { label: 'When', get: (s) => `<span style="color:var(--ink-3)">${esc(s.ts)}</span>` },
+        { label: 'When', get: (s) => `<span class="mono">${esc(s.ts)}</span>` },
         { label: 'Job', get: (s) => `<b>${esc(s.job)}</b>` },
         { label: 'Device', get: (s) => esc(s.device || '—') },
         { label: 'Result', get: (s) => esc(s.result || '') },
@@ -154,48 +392,18 @@ export default {
       ], rows, { empty: 'Nothing transferred yet' });
     }
 
-    // --- actions ---
-    host.querySelector('#btnUpload').addEventListener('click', (e) =>
-      withBusy(e.currentTarget, async () => {
-        const ids = chosenIds();
-        if (!ids.length) throw new Error('No members are selected.');
-        const n = await api.uploadUsers(ids);
-        toast('ok', `${n} update${n === 1 ? '' : 's'} queued for the terminal`);
-        await loadHistory();
-      }).catch(() => {}),
-    );
+    // Punches arriving over the push listener are worth a console line too:
+    // they are the clearest sign the terminal is actually talking to this PC.
+    const stop = await listen('punch', (p) => {
+      say('info', `Scan · enrolment ${p.enroll_no} at ${String(p.punch_time).slice(11, 16)}`);
+    });
 
-    host.querySelector('#btnDownUsers').addEventListener('click', (e) =>
-      withBusy(e.currentTarget, async () => {
-        const d = deviceById('#dnDev');
-        if (!d) throw new Error('No terminal is selected.');
-        const n = await api.downloadUsers(d.ip, d.port, d.comm_key);
-        toast('ok', n ? `${n} new user${n === 1 ? '' : 's'} added` : 'No new users on the terminal');
-        await loadHistory();
-      }).catch(() => {}),
-    );
-
-    host.querySelector('#btnLogs').addEventListener('click', (e) =>
-      withBusy(e.currentTarget, async () => {
-        const d = deviceById('#lgDev');
-        if (!d) throw new Error('No terminal is selected.');
-        const clear = host.querySelector('#clearAfter').checked;
-        const r = await api.downloadLogs(d.ip, d.port, d.comm_key, d.serial || '', clear);
-        toast('ok', `${r.fetched} records read · ${r.accepted} new · ${r.duplicates} already held`);
-        await loadHistory();
-      }).catch(() => {}),
-    );
-
-    host.querySelector('#btnRecompute').addEventListener('click', (e) =>
-      withBusy(e.currentTarget, async () => {
-        const from = host.querySelector('#recFrom').value;
-        const to = host.querySelector('#recTo').value;
-        if (!from || !to) throw new Error('Choose both a start and an end date.');
-        const n = await api.recompute(from, to);
-        toast('ok', `${n} day record${n === 1 ? '' : 's'} rebuilt`);
-      }).catch(() => {}),
-    );
-
+    wireDateFields(body);
+    paintAction();
+    say('info', 'Console ready.');
+    await testDevice();
     await loadHistory();
+
+    return () => { if (typeof stop === 'function') stop(); };
   },
 };

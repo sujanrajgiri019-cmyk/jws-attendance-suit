@@ -14,6 +14,7 @@ use std::path::Path;
 static MIGRATIONS: &[(&str, &str)] = &[
     ("001_initial", include_str!("../migrations/001_initial.sql")),
     ("002_seed", include_str!("../migrations/002_seed.sql")),
+    ("003_scheduling", include_str!("../migrations/003_scheduling.sql")),
 ];
 
 /// Open (creating if needed) the attendance database and bring it up to date.
@@ -61,11 +62,39 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     for (i, (name, sql)) in MIGRATIONS.iter().enumerate().skip(current) {
         tracing::info!("applying migration {name}");
-        // execute_batch runs inside an implicit transaction per statement; wrap
-        // the whole migration so a failure part-way leaves nothing behind.
-        conn.execute_batch(&format!("BEGIN; {sql} COMMIT;")).map_err(|e| {
-            Error::Invalid(format!("migration {name} failed: {e}"))
-        })?;
+
+        // Restructuring a table in SQLite means building a new one, copying the
+        // rows across and dropping the original. With foreign keys enforced,
+        // the drop trips over rows that legitimately still point at the table
+        // being replaced. SQLite's own documented recipe is to switch
+        // enforcement off for the rebuild and verify afterwards — and the
+        // pragma is silently ignored inside a transaction, so it has to be set
+        // out here rather than at the top of the .sql file.
+        conn.pragma_update(None, "foreign_keys", "OFF")?;
+
+        let applied = conn
+            .execute_batch(&format!("BEGIN; {sql} COMMIT;"))
+            .map_err(|e| Error::Invalid(format!("migration {name} failed: {e}")));
+
+        // Whatever happened, enforcement goes back on before returning.
+        let restored = conn.pragma_update(None, "foreign_keys", "ON");
+        applied?;
+        restored?;
+
+        // A migration that leaves a dangling reference has corrupted the file
+        // quietly. Refuse to record it as applied.
+        let orphans: i64 = conn
+            .prepare("PRAGMA foreign_key_check")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .count() as i64;
+        if orphans > 0 {
+            return Err(Error::Invalid(format!(
+                "migration {name} left {orphans} row(s) pointing at records that \
+                 no longer exist. The database has not been marked as upgraded; \
+                 restore the most recent backup and report this."
+            )));
+        }
+
         conn.pragma_update(None, "user_version", (i + 1) as i64)?;
     }
     Ok(())
@@ -217,33 +246,175 @@ mod tests {
             conn.query_row("SELECT count(*) FROM departments", [], |r| r.get(0)).unwrap();
         assert_eq!(depts, 8);
 
-        let shifts: i64 = conn.query_row("SELECT count(*) FROM shifts", [], |r| r.get(0)).unwrap();
-        assert_eq!(shifts, 6);
+        // 003 swapped the two words: the six seeded blocks of duty are now
+        // timetables, and the four weekly plans built from them are shifts.
+        let timetables: i64 =
+            conn.query_row("SELECT count(*) FROM timetables", [], |r| r.get(0)).unwrap();
+        assert_eq!(timetables, 6, "the six blocks of duty must survive migration");
 
-        // Every timetable must define all seven weekdays or scheduling silently
-        // has holes.
-        let bad: i64 = conn
+        let shifts: i64 = conn.query_row("SELECT count(*) FROM shifts", [], |r| r.get(0)).unwrap();
+        assert_eq!(shifts, 4, "the four weekly plans must survive migration");
+
+        // A weekday with no shift_items row is a rest day. The two Sunday-to-
+        // Friday plans must therefore have six working days each, with the
+        // missing one being Saturday.
+        for shift in [1, 2] {
+            let days: Vec<i64> = conn
+                .prepare("SELECT day_index FROM shift_items WHERE shift_id=?1 ORDER BY day_index")
+                .unwrap()
+                .query_map(params![shift], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert_eq!(days, vec![0, 1, 2, 3, 4, 5], "shift {shift} should work Sun-Fri");
+            assert!(!days.contains(&6), "shift {shift} should have Saturday off");
+        }
+    }
+
+    #[test]
+    fn migration_003_carries_every_row_across_the_rename() {
+        // The rename of shifts <-> timetables rebuilds four tables. A row lost
+        // here is a member with no schedule or a day of history detached from
+        // its block of duty, and neither announces itself.
+        let conn = open_memory().unwrap();
+
+        // Nothing may be left pointing at a record that no longer exists.
+        let orphans = conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .count();
+        assert_eq!(orphans, 0, "migration left dangling references");
+
+        // The scaffolding must be gone.
+        for gone in ["_old_shifts", "_old_timetables", "_old_timetable_days"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![gone],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "{gone} should have been dropped");
+        }
+
+        // Every shift_items row must resolve to a real timetable on both sides.
+        let dangling: i64 = conn
             .query_row(
-                "SELECT count(*) FROM (
-                     SELECT timetable_id FROM timetable_days
-                     GROUP BY timetable_id HAVING count(*) <> 7)",
+                "SELECT count(*) FROM shift_items si
+                 LEFT JOIN shifts s     ON s.id  = si.shift_id
+                 LEFT JOIN timetables t ON t.id  = si.timetable_id
+                 WHERE s.id IS NULL OR t.id IS NULL",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(bad, 0, "every timetable must cover all 7 weekdays");
+        assert_eq!(dangling, 0);
 
-        // Saturday off for the two Sun-Fri timetables.
-        for tt in [1, 2] {
-            let sat: Option<i64> = conn
-                .query_row(
-                    "SELECT shift_id FROM timetable_days WHERE timetable_id=?1 AND weekday=6",
-                    params![tt],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert!(sat.is_none(), "timetable {tt} should have Saturday off");
+        // Departments kept their default plan under its new column name.
+        let with_default: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM departments WHERE default_shift_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(with_default > 0, "departments lost their default shift");
+
+        // The rules row exists, exactly once, and cannot be duplicated.
+        let rules: i64 =
+            conn.query_row("SELECT count(*) FROM attendance_rules", [], |r| r.get(0)).unwrap();
+        assert_eq!(rules, 1);
+        assert!(
+            conn.execute("INSERT INTO attendance_rules (id) VALUES (2)", []).is_err(),
+            "attendance_rules must hold exactly one row"
+        );
+    }
+
+    #[test]
+    fn migration_003_preserves_existing_assignments_and_history() {
+        // Build a database at version 2 — the shape a school PC already has —
+        // then let 003 run against it and check the data came through.
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        for (name, sql) in &MIGRATIONS[..2] {
+            conn.execute_batch(&format!("BEGIN; {sql} COMMIT;"))
+                .unwrap_or_else(|e| panic!("{name} failed: {e}"));
         }
+        conn.pragma_update(None, "user_version", 2i64).unwrap();
+
+        // A member on the Sunday-to-Friday plan, with a day of history against
+        // the "regular" block of duty.
+        conn.execute(
+            "INSERT INTO members (id, enroll_no, full_name, dept_id, timetable_id, joined_on)
+             VALUES (77, 4177, 'Test Teacher', 1, 1, '2025-01-15')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO attendance (member_id, work_date, shift_id, in_time, out_time,
+                                     worked_min, late_min, status)
+             VALUES (77, '2026-08-18', 1, '09:02:00', '16:31:00', 409, 0, 'Present')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(version(&conn).unwrap(), MIGRATIONS.len());
+
+        // The assignment became a schedule row, backdated to the joining date.
+        let (shift_id, start, temp): (i64, String, i64) = conn
+            .query_row(
+                "SELECT shift_id, start_date, is_temporary FROM employee_schedules
+                 WHERE member_id = 77",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(shift_id, 1, "member kept their weekly plan");
+        assert_eq!(start, "2025-01-15", "schedule backdated to the joining date");
+        assert_eq!(temp, 0);
+
+        // The day of history kept its figures and now names a timetable.
+        let (tt, worked, status): (i64, i64, String) = conn
+            .query_row(
+                "SELECT timetable_id, worked_min, status FROM attendance
+                 WHERE member_id = 77 AND work_date = '2026-08-18'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(tt, 1);
+        assert_eq!(worked, 409, "computed minutes must not be disturbed");
+        assert_eq!(status, "Present");
+
+        // The block of duty kept its clock times under the new column names.
+        let (on, off): (String, String) = conn
+            .query_row("SELECT on_duty, off_duty FROM timetables WHERE id=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((on.as_str(), off.as_str()), ("09:00", "16:00"));
+
+        // 001 had no in/out boundary, so 003 invents one at the midpoint of the
+        // shift. For 09:00-16:00 that is 12:30 — lunchtime, which is exactly
+        // where a stray midday scan should stop counting as the day's arrival.
+        let (in_end, out_begin): (String, String) = conn
+            .query_row("SELECT in_end, out_begin FROM timetables WHERE id=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(in_end, "12:30");
+        assert_eq!(out_begin, "12:30");
+
+        // The night guard's 19:00-06:00 crosses midnight. Averaging the two
+        // clock readings naively puts the boundary at half past noon, in the
+        // middle of his sleep; it belongs at half past midnight.
+        let night: String = conn
+            .query_row("SELECT in_end FROM timetables WHERE name='Night Guard'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(night, "00:30", "overnight block split at the wrong end of the day");
     }
 
     #[test]

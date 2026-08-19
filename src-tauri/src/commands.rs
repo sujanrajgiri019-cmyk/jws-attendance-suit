@@ -25,11 +25,11 @@ pub struct AppState {
     pub started: std::time::Instant,
 }
 
-type R<T> = Result<T, String>;
+pub type R<T> = Result<T, String>;
 
 /// Lock the database, turning a poisoned mutex into a readable message rather
 /// than a panic that takes the window down.
-fn conn(state: &AppState) -> R<std::sync::MutexGuard<'_, Connection>> {
+pub fn conn(state: &AppState) -> R<std::sync::MutexGuard<'_, Connection>> {
     state.db.lock().map_err(|_| {
         "The database is in an inconsistent state after an earlier error. \
          Please restart JWS Attendance."
@@ -63,8 +63,8 @@ pub struct AppInfo {
     pub uptime_secs: u64,
 }
 
-#[tauri::command]
-pub fn app_info(app: AppHandle, state: State<AppState>) -> R<AppInfo> {
+#[tauri::command(async)]
+pub fn app_info(app: AppHandle, state: State<'_, AppState>) -> R<AppInfo> {
     let c = conn(&state)?;
     let path = crate::db_path(&app);
     let size = std::fs::metadata(&path).map(|m| m.len() / 1024).unwrap_or(0);
@@ -89,8 +89,8 @@ pub fn app_info(app: AppHandle, state: State<AppState>) -> R<AppInfo> {
     })
 }
 
-#[tauri::command]
-pub fn dashboard(state: State<AppState>, date: Option<String>) -> R<service::DashboardStats> {
+#[tauri::command(async)]
+pub fn dashboard(state: State<'_, AppState>, date: Option<String>) -> R<service::DashboardStats> {
     let c = conn(&state)?;
     service::dashboard(&c, &date.unwrap_or_else(today)).map_err(|e| e.to_string())
 }
@@ -103,8 +103,8 @@ pub struct TrendPoint {
     pub absent: i64,
 }
 
-#[tauri::command]
-pub fn attendance_trend(state: State<AppState>, days: i64) -> R<Vec<TrendPoint>> {
+#[tauri::command(async)]
+pub fn attendance_trend(state: State<'_, AppState>, days: i64) -> R<Vec<TrendPoint>> {
     let c = conn(&state)?;
     let days = days.clamp(1, 120);
     let mut stmt = c
@@ -143,8 +143,8 @@ pub struct DeptStat {
     pub rate: f64,
 }
 
-#[tauri::command]
-pub fn department_stats(state: State<AppState>, date: Option<String>) -> R<Vec<DeptStat>> {
+#[tauri::command(async)]
+pub fn department_stats(state: State<'_, AppState>, date: Option<String>) -> R<Vec<DeptStat>> {
     let c = conn(&state)?;
     let d = date.unwrap_or_else(today);
     let mut stmt = c
@@ -185,8 +185,8 @@ pub struct FeedItem {
     pub punch_state: i64,
 }
 
-#[tauri::command]
-pub fn punch_feed(state: State<AppState>, limit: i64) -> R<Vec<FeedItem>> {
+#[tauri::command(async)]
+pub fn punch_feed(state: State<'_, AppState>, limit: i64) -> R<Vec<FeedItem>> {
     let c = conn(&state)?;
     let mut stmt = c
         .prepare(
@@ -216,9 +216,9 @@ pub fn punch_feed(state: State<AppState>, limit: i64) -> R<Vec<FeedItem>> {
 // Members / departments
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_members(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     search: Option<String>,
     dept_id: Option<i64>,
     status: Option<String>,
@@ -228,8 +228,8 @@ pub fn list_members(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn save_member(state: State<AppState>, member: MemberInput) -> R<i64> {
+#[tauri::command(async)]
+pub fn save_member(state: State<'_, AppState>, member: MemberInput) -> R<i64> {
     let c = conn(&state)?;
     let id = service::save_member(&c, &member).map_err(|e| e.to_string())?;
 
@@ -264,8 +264,8 @@ fn device_serials(c: &Connection) -> Vec<String> {
         .unwrap_or_default()
 }
 
-#[tauri::command]
-pub fn delete_members(state: State<AppState>, ids: Vec<i64>) -> R<usize> {
+#[tauri::command(async)]
+pub fn delete_members(state: State<'_, AppState>, ids: Vec<i64>) -> R<usize> {
     let c = conn(&state)?;
     // Collect enrolment numbers before deleting so the terminals can be told.
     let mut pins = Vec::new();
@@ -288,14 +288,14 @@ pub fn delete_members(state: State<AppState>, ids: Vec<i64>) -> R<usize> {
     Ok(n)
 }
 
-#[tauri::command]
-pub fn set_members_department(state: State<AppState>, ids: Vec<i64>, dept_id: i64) -> R<usize> {
+#[tauri::command(async)]
+pub fn set_members_department(state: State<'_, AppState>, ids: Vec<i64>, dept_id: i64) -> R<usize> {
     let c = conn(&state)?;
     service::set_members_department(&c, &ids, dept_id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn list_departments(state: State<AppState>) -> R<Vec<service::Department>> {
+#[tauri::command(async)]
+pub fn list_departments(state: State<'_, AppState>) -> R<Vec<service::Department>> {
     let c = conn(&state)?;
     service::list_departments(&c).map_err(|e| e.to_string())
 }
@@ -310,8 +310,8 @@ pub struct DeptInput {
     pub default_timetable_id: Option<i64>,
 }
 
-#[tauri::command]
-pub fn save_department(state: State<AppState>, dept: DeptInput) -> R<i64> {
+#[tauri::command(async)]
+pub fn save_department(state: State<'_, AppState>, dept: DeptInput) -> R<i64> {
     let c = conn(&state)?;
     service::save_department(
         &c,
@@ -325,8 +325,8 @@ pub fn save_department(state: State<AppState>, dept: DeptInput) -> R<i64> {
     .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn delete_department(state: State<AppState>, id: i64) -> R<()> {
+#[tauri::command(async)]
+pub fn delete_department(state: State<'_, AppState>, id: i64) -> R<()> {
     let c = conn(&state)?;
     service::delete_department(&c, id).map_err(|e| e.to_string())
 }
@@ -335,8 +335,8 @@ pub fn delete_department(state: State<AppState>, id: i64) -> R<()> {
 // Devices
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub fn list_devices(state: State<AppState>) -> R<Vec<service::Device>> {
+#[tauri::command(async)]
+pub fn list_devices(state: State<'_, AppState>) -> R<Vec<service::Device>> {
     let c = conn(&state)?;
     service::list_devices(&c).map_err(|e| e.to_string())
 }
@@ -353,8 +353,8 @@ pub struct DeviceInput {
     pub location: Option<String>,
 }
 
-#[tauri::command]
-pub fn save_device(state: State<AppState>, device: DeviceInput) -> R<i64> {
+#[tauri::command(async)]
+pub fn save_device(state: State<'_, AppState>, device: DeviceInput) -> R<i64> {
     let c = conn(&state)?;
     service::save_device(
         &c,
@@ -370,12 +370,12 @@ pub fn save_device(state: State<AppState>, device: DeviceInput) -> R<i64> {
     .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn device_ping(ip: String, port: u16) -> R<u128> {
     pull::ping(&ip, port, Duration::from_secs(3)).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn device_info(ip: String, port: u16, comm_key: u32) -> R<pull::DeviceInfo> {
     let mut d = pull::Device::connect(&ip, port, comm_key, Duration::from_secs(5))
         .map_err(|e| e.to_string())?;
@@ -392,18 +392,103 @@ pub struct PullResult {
     pub recomputed: usize,
 }
 
+/// Is this terminal set up to dial out to us, rather than to be dialled?
+///
+/// A device in ADMS/push mode almost always closes its direct TCP port: the
+/// whole point of that mode is that the terminal reaches the server, not the
+/// other way round. Trying to pull from it produces nothing but an eight second
+/// wait and "device did not respond in time", which tells the office nothing.
+fn is_push_device(c: &Connection, ip: &str, serial: &str) -> bool {
+    c.query_row(
+        "SELECT mode FROM devices WHERE serial = ?1 OR ip = ?2 LIMIT 1",
+        params![serial, ip],
+        |r| r.get::<_, String>(0),
+    )
+    .map(|m| m.eq_ignore_ascii_case("push"))
+    .unwrap_or(false)
+}
+
+/// When did this terminal last make contact over the push listener?
+fn last_seen(c: &Connection, ip: &str, serial: &str) -> Option<String> {
+    c.query_row(
+        "SELECT last_seen FROM devices WHERE serial = ?1 OR ip = ?2 LIMIT 1",
+        params![serial, ip],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+}
+
+/// Explain a failed pull in terms the office can act on.
+fn pull_advice(c: &Connection, ip: &str, port: u16, serial: &str, err: &str) -> String {
+    match last_seen(c, ip, serial) {
+        Some(when) => format!(
+            "{err}\n\nThe terminal itself is fine — it last reported in at {when} over the \
+             push connection. What failed is this PC dialling out to {ip}:{port}, and a \
+             terminal set to send to a cloud server usually keeps that port shut.\n\n\
+             Switch the terminal to Pull mode on the Devices screen if you want direct \
+             transfers, or leave it as it is and use the buttons here, which now ask the \
+             terminal to send its data instead.",
+        ),
+        None => format!(
+            "{err}\n\nThis PC could not reach {ip}:{port}, and the terminal has never \
+             reported in either. Check that the IP address on the Devices screen matches \
+             the one shown in the terminal's own network menu — a router handing out \
+             addresses will change it after a power cut."
+        ),
+    }
+}
+
 /// Pull-mode fetch of the terminal's stored attendance log.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn device_download_logs(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     ip: String,
     port: u16,
     comm_key: u32,
     serial: String,
     clear_after: bool,
 ) -> R<PullResult> {
+    {
+        // A push-mode terminal is asked, not dialled. The records arrive on its
+        // next check-in — seconds later on a device with a short interval —
+        // through the same path the live punches already take.
+        let c = conn(&state)?;
+        if is_push_device(&c, &ip, &serial) {
+            let from = c
+                .query_row("SELECT date('now','localtime','-60 day')", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap_or_else(|_| "2020-01-01".into());
+            let to = c
+                .query_row("SELECT date('now','localtime')", [], |r| r.get::<_, String>(0))
+                .unwrap_or_else(|_| "2030-01-01".into());
+
+            crate::push_server::queue_command(
+                &c,
+                &serial,
+                &zk_core::push::DeviceCommand::QueryAttlog { from, to },
+            )?;
+            if clear_after {
+                crate::push_server::queue_command(
+                    &c,
+                    &serial,
+                    &zk_core::push::DeviceCommand::ClearLog,
+                )?;
+            }
+            let _ = db::log_sync(&c, "Request logs", &serial, "queued for the terminal", true);
+            return Ok(PullResult { fetched: 0, accepted: 0, duplicates: 0, recomputed: 0 });
+        }
+    }
+
     let mut dev = pull::Device::connect(&ip, port, comm_key, Duration::from_secs(8))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let c = conn(&state);
+            match c {
+                Ok(c) => pull_advice(&c, &ip, port, &serial, &e.to_string()),
+                Err(_) => e.to_string(),
+            }
+        })?;
     let logs = dev.attendance().map_err(|e| e.to_string())?;
 
     let mut c = conn(&state)?;
@@ -434,15 +519,40 @@ pub fn device_download_logs(
     Ok(PullResult { fetched: logs.len(), accepted, duplicates, recomputed })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn device_download_users(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     ip: String,
     port: u16,
     comm_key: u32,
 ) -> R<usize> {
+    {
+        let c = conn(&state)?;
+        let serial: String = c
+            .query_row("SELECT COALESCE(serial,'') FROM devices WHERE ip=?1", params![ip], |r| {
+                r.get(0)
+            })
+            .unwrap_or_default();
+        if is_push_device(&c, &ip, &serial) {
+            crate::push_server::queue_command(
+                &c,
+                &serial,
+                &zk_core::push::DeviceCommand::QueryUserInfo,
+            )?;
+            let _ = db::log_sync(&c, "Request users", &serial, "queued for the terminal", true);
+            // Nothing has arrived yet; the caller reports it as a request, not
+            // as a count of users added.
+            return Ok(0);
+        }
+    }
+
     let mut dev = pull::Device::connect(&ip, port, comm_key, Duration::from_secs(8))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            match conn(&state) {
+                Ok(c) => pull_advice(&c, &ip, port, "", &e.to_string()),
+                Err(_) => e.to_string(),
+            }
+        })?;
     let users = dev.users().map_err(|e| e.to_string())?;
     let _ = dev.disconnect();
 
@@ -474,8 +584,8 @@ pub fn device_download_users(
 }
 
 /// Queue every selected member for upload to the terminals.
-#[tauri::command]
-pub fn device_upload_users(state: State<AppState>, member_ids: Vec<i64>) -> R<usize> {
+#[tauri::command(async)]
+pub fn device_upload_users(state: State<'_, AppState>, member_ids: Vec<i64>) -> R<usize> {
     let c = conn(&state)?;
     let serials = device_serials(&c);
     if serials.is_empty() {
@@ -520,8 +630,8 @@ pub fn device_upload_users(state: State<AppState>, member_ids: Vec<i64>) -> R<us
 // Push listener
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub fn push_start(app: AppHandle, state: State<AppState>, port: Option<u16>) -> R<u16> {
+#[tauri::command(async)]
+pub fn push_start(app: AppHandle, state: State<'_, AppState>, port: Option<u16>) -> R<u16> {
     let mut guard = state.push.lock().map_err(|_| "push state unavailable")?;
     if let Some(l) = guard.as_ref() {
         if l.is_running() {
@@ -541,8 +651,8 @@ pub fn push_start(app: AppHandle, state: State<AppState>, port: Option<u16>) -> 
     Ok(p)
 }
 
-#[tauri::command]
-pub fn push_stop(state: State<AppState>) -> R<()> {
+#[tauri::command(async)]
+pub fn push_stop(state: State<'_, AppState>) -> R<()> {
     let guard = state.push.lock().map_err(|_| "push state unavailable")?;
     if let Some(l) = guard.as_ref() {
         l.stop();
@@ -551,7 +661,7 @@ pub fn push_stop(state: State<AppState>) -> R<()> {
 }
 
 /// The LAN addresses to point the terminal's "Server Address" at.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn local_addresses() -> R<Vec<String>> {
     // Resolving the machine's own hostname is enough on a school LAN and
     // avoids pulling in a network-interface crate.
@@ -576,9 +686,9 @@ pub fn local_addresses() -> R<Vec<String>> {
 // Attendance
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn attendance_range(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     from: String,
     to: String,
     dept_id: Option<i64>,
@@ -590,16 +700,16 @@ pub fn attendance_range(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn recompute(state: State<AppState>, from: String, to: String) -> R<usize> {
+#[tauri::command(async)]
+pub fn recompute(state: State<'_, AppState>, from: String, to: String) -> R<usize> {
     let mut c = conn(&state)?;
     service::recompute(&mut c, &from, &to).map_err(|e| e.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn override_attendance(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     member_id: i64,
     work_date: String,
     status: String,
@@ -624,8 +734,8 @@ pub fn override_attendance(
 // Shifts, timetables, holidays
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub fn list_shifts(state: State<AppState>) -> R<Vec<serde_json::Value>> {
+#[tauri::command(async)]
+pub fn list_shifts(state: State<'_, AppState>) -> R<Vec<serde_json::Value>> {
     let c = conn(&state)?;
     rows_to_json(
         &c,
@@ -637,8 +747,8 @@ pub fn list_shifts(state: State<AppState>) -> R<Vec<serde_json::Value>> {
     )
 }
 
-#[tauri::command]
-pub fn list_timetables(state: State<AppState>) -> R<Vec<serde_json::Value>> {
+#[tauri::command(async)]
+pub fn list_timetables(state: State<'_, AppState>) -> R<Vec<serde_json::Value>> {
     let c = conn(&state)?;
     rows_to_json(
         &c,
@@ -652,8 +762,8 @@ pub fn list_timetables(state: State<AppState>) -> R<Vec<serde_json::Value>> {
     )
 }
 
-#[tauri::command]
-pub fn list_holidays(state: State<AppState>) -> R<Vec<serde_json::Value>> {
+#[tauri::command(async)]
+pub fn list_holidays(state: State<'_, AppState>) -> R<Vec<serde_json::Value>> {
     let c = conn(&state)?;
     rows_to_json(
         &c,
@@ -674,8 +784,8 @@ pub struct HolidayInput {
     pub paid: Option<bool>,
 }
 
-#[tauri::command]
-pub fn save_holiday(state: State<AppState>, holiday: HolidayInput) -> R<i64> {
+#[tauri::command(async)]
+pub fn save_holiday(state: State<'_, AppState>, holiday: HolidayInput) -> R<i64> {
     if holiday.to_date < holiday.from_date {
         return Err("The end date is before the start date.".into());
     }
@@ -704,15 +814,15 @@ pub fn save_holiday(state: State<AppState>, holiday: HolidayInput) -> R<i64> {
     }
 }
 
-#[tauri::command]
-pub fn delete_holiday(state: State<AppState>, id: i64) -> R<()> {
+#[tauri::command(async)]
+pub fn delete_holiday(state: State<'_, AppState>, id: i64) -> R<()> {
     let c = conn(&state)?;
     c.execute("DELETE FROM holidays WHERE id=?1", params![id]).map_err(|e| e.to_string())?;
     Ok(())
 }
 
-#[tauri::command]
-pub fn set_member_timetable(state: State<AppState>, member_id: i64, timetable_id: Option<i64>) -> R<()> {
+#[tauri::command(async)]
+pub fn set_member_timetable(state: State<'_, AppState>, member_id: i64, timetable_id: Option<i64>) -> R<()> {
     let c = conn(&state)?;
     c.execute(
         "UPDATE members SET timetable_id=?1 WHERE id=?2",
@@ -726,15 +836,15 @@ pub fn set_member_timetable(state: State<AppState>, member_id: i64, timetable_id
 // Rules & settings
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub fn get_rules(state: State<AppState>) -> R<serde_json::Map<String, serde_json::Value>> {
+#[tauri::command(async)]
+pub fn get_rules(state: State<'_, AppState>) -> R<serde_json::Map<String, serde_json::Value>> {
     let c = conn(&state)?;
     kv_map(&c, "SELECT key, value FROM rules")
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_rules(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     rules: std::collections::HashMap<String, String>,
 ) -> R<usize> {
     let c = conn(&state)?;
@@ -746,8 +856,8 @@ pub fn set_rules(
     Ok(rules.len())
 }
 
-#[tauri::command]
-pub fn get_settings(state: State<AppState>) -> R<serde_json::Map<String, serde_json::Value>> {
+#[tauri::command(async)]
+pub fn get_settings(state: State<'_, AppState>) -> R<serde_json::Map<String, serde_json::Value>> {
     let c = conn(&state)?;
     let mut m = kv_map(&c, "SELECT key, value FROM settings")?;
     // Never hand the SMTP password to the UI; show only whether one is set.
@@ -759,9 +869,9 @@ pub fn get_settings(state: State<AppState>) -> R<serde_json::Map<String, serde_j
     Ok(m)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_settings(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     settings: std::collections::HashMap<String, String>,
 ) -> R<usize> {
     let c = conn(&state)?;
@@ -805,9 +915,9 @@ const BROWSABLE: &[&str] = &[
     "device_commands",
 ];
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn browse_table(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     table: String,
     limit: Option<i64>,
     offset: Option<i64>,
@@ -857,8 +967,8 @@ fn rows_to_json(
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn sync_history(state: State<AppState>, limit: i64) -> R<Vec<serde_json::Value>> {
+#[tauri::command(async)]
+pub fn sync_history(state: State<'_, AppState>, limit: i64) -> R<Vec<serde_json::Value>> {
     let c = conn(&state)?;
     rows_to_json(
         &c,
@@ -890,9 +1000,9 @@ pub struct ReportRow {
     pub rate: f64,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn report_summary(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     from: String,
     to: String,
     dept_id: Option<i64>,
@@ -925,9 +1035,9 @@ pub fn report_summary(
     Ok(out)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn export_csv(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     from: String,
     to: String,
     dept_id: Option<i64>,
@@ -974,8 +1084,8 @@ pub fn export_csv(
 // Authentication
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub fn auth_login(state: State<AppState>, username: String, password: String) -> R<bool> {
+#[tauri::command(async)]
+pub fn auth_login(state: State<'_, AppState>, username: String, password: String) -> R<bool> {
     let c = conn(&state)?;
     let user = db::get_setting(&c, "admin_username").ok().flatten().unwrap_or_default();
     if username.trim() != user {
@@ -1007,8 +1117,8 @@ pub fn auth_login(state: State<AppState>, username: String, password: String) ->
     Ok(ok)
 }
 
-#[tauri::command]
-pub fn auth_change_password(state: State<AppState>, current: String, new: String) -> R<()> {
+#[tauri::command(async)]
+pub fn auth_change_password(state: State<'_, AppState>, current: String, new: String) -> R<()> {
     let c = conn(&state)?;
     let stored = db::get_setting(&c, "admin_password_hash").ok().flatten().unwrap_or_default();
 
@@ -1029,8 +1139,8 @@ pub fn auth_change_password(state: State<AppState>, current: String, new: String
     Ok(())
 }
 
-#[tauri::command]
-pub fn auth_request_reset(state: State<AppState>) -> R<String> {
+#[tauri::command(async)]
+pub fn auth_request_reset(state: State<'_, AppState>) -> R<String> {
     let c = conn(&state)?;
     let to = db::get_setting(&c, "recovery_email")
         .ok()
@@ -1062,8 +1172,8 @@ pub fn auth_request_reset(state: State<AppState>) -> R<String> {
     Ok(masked)
 }
 
-#[tauri::command]
-pub fn auth_verify_reset(state: State<AppState>, code: String, new_password: String) -> R<()> {
+#[tauri::command(async)]
+pub fn auth_verify_reset(state: State<'_, AppState>, code: String, new_password: String) -> R<()> {
     let mut guard = state.reset.lock().map_err(|_| "reset state unavailable")?;
     let Some((expected, expires)) = guard.clone() else {
         return Err("No reset is in progress. Request a new code first.".into());
@@ -1090,8 +1200,8 @@ pub fn auth_verify_reset(state: State<AppState>, code: String, new_password: Str
 // Email
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub fn send_test_mail(state: State<AppState>, to: Option<String>) -> R<String> {
+#[tauri::command(async)]
+pub fn send_test_mail(state: State<'_, AppState>, to: Option<String>) -> R<String> {
     let c = conn(&state)?;
     let s = mailer::settings_from_db(&c)?;
     let school = db::get_setting(&c, "school_name").ok().flatten().unwrap_or_default();
@@ -1120,8 +1230,8 @@ pub struct MailRun {
     pub errors: Vec<String>,
 }
 
-#[tauri::command]
-pub fn send_absence_emails(state: State<AppState>, date: Option<String>) -> R<MailRun> {
+#[tauri::command(async)]
+pub fn send_absence_emails(state: State<'_, AppState>, date: Option<String>) -> R<MailRun> {
     let c = conn(&state)?;
     let day = date.unwrap_or_else(today);
     let list = service::absentees(&c, &day).map_err(|e| e.to_string())?;
@@ -1163,8 +1273,8 @@ pub fn send_absence_emails(state: State<AppState>, date: Option<String>) -> R<Ma
 // Backup
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub fn backup_now(app: AppHandle, state: State<AppState>) -> R<String> {
+#[tauri::command(async)]
+pub fn backup_now(app: AppHandle, state: State<'_, AppState>) -> R<String> {
     let c = conn(&state)?;
     let dir = db::get_setting(&c, "backup_dir")
         .ok()
@@ -1185,8 +1295,8 @@ pub fn backup_now(app: AppHandle, state: State<AppState>) -> R<String> {
     Ok(dest.display().to_string())
 }
 
-#[tauri::command]
-pub fn list_backups(app: AppHandle, state: State<AppState>) -> R<Vec<serde_json::Value>> {
+#[tauri::command(async)]
+pub fn list_backups(app: AppHandle, state: State<'_, AppState>) -> R<Vec<serde_json::Value>> {
     let c = conn(&state)?;
     let dir = db::get_setting(&c, "backup_dir")
         .ok()
@@ -1223,13 +1333,13 @@ pub fn list_backups(app: AppHandle, state: State<AppState>) -> R<Vec<serde_json:
     Ok(out)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn open_path(app: AppHandle, path: String) -> R<()> {
     use tauri_plugin_opener::OpenerExt;
     app.opener().open_path(path, None::<&str>).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_text_file(path: String, contents: String) -> R<()> {
     std::fs::write(&path, contents).map_err(|e| format!("could not write {path}: {e}"))?;
     Ok(())

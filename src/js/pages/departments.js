@@ -21,7 +21,7 @@ export default {
     async function load() {
       const today = todayIso();
       const [depts, stats, members, timetables] = await Promise.all([
-        api.listDepartments(), api.departmentStats(today), api.listMembers(), api.listTimetables(),
+        api.listDepartments(), api.departmentStats(today), api.listMembers(), api.listShifts(),
       ]);
       const statFor = (id) => stats.find((s) => s.id === id) || { present: 0, total: 0, rate: 0 };
 
@@ -129,12 +129,12 @@ function dialog(d, members, timetables) {
           <option value="">Not assigned</option>
           ${members.map((m) => `<option value="${m.id}" ${d.head_member_id === m.id ? 'selected' : ''}>${esc(m.full_name)}</option>`).join('')}
         </select></div>
-      <div class="fld"><label>Default timetable</label>
-        <select class="inp" name="default_timetable_id">
+      <div class="fld"><label>Default shift</label>
+        <select class="inp" name="default_shift_id">
           <option value="">Not set</option>
-          ${timetables.map((t) => `<option value="${t.id}" ${d.default_timetable_id === t.id ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}
+          ${timetables.map((t) => `<option value="${t.id}" ${d.default_shift_id === t.id ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}
         </select>
-        <div class="hint">Applies to any member without their own timetable.</div></div>
+        <div class="hint">Used for any member of staff who has no schedule of their own.</div></div>
       <div class="fld"><label>Colour</label>
         <div style="display:flex;gap:8px;flex-wrap:wrap" id="swatches">
           ${PALETTE.map((c) => `<span data-colour="${c}" style="width:28px;height:28px;border-radius:7px;
@@ -154,7 +154,7 @@ function dialog(d, members, timetables) {
             code: (f.code || f.name.slice(0, 3)).toUpperCase(),
             colour: f.colour,
             head_member_id: f.head_member_id ? Number(f.head_member_id) : null,
-            default_timetable_id: f.default_timetable_id ? Number(f.default_timetable_id) : null,
+            default_shift_id: f.default_shift_id ? Number(f.default_shift_id) : null,
           });
           toast('ok', isNew ? 'Department created' : 'Department saved');
           return true;

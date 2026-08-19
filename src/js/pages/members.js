@@ -3,6 +3,7 @@ import {
   icon, esc, table, person, modal, toast, withBusy, confirmDialog,
   loadingTable, readForm,
 } from '../ui.js';
+import { dateField, wireDateFields } from '../nepali.js';
 
 const PRIVILEGES = [
   [0, 'User'], [2, 'Enroller'], [6, 'Manager'], [14, 'Super Admin'],
@@ -16,7 +17,7 @@ export default {
     selected = new Set();
 
     const depts = await api.listDepartments();
-    const timetables = await api.listTimetables();
+    const timetables = await api.listShifts();
 
     host.innerHTML = `
       <div class="tbar">
@@ -283,8 +284,7 @@ async function editMember(m, depts, timetables) {
                 <option value="">—</option>
                 ${['Male', 'Female', 'Other'].map((g) => `<option ${m.gender === g ? 'selected' : ''}>${g}</option>`).join('')}
               </select></div>
-            <div class="fld"><label>Date of birth</label>
-              <input type="date" class="inp" name="dob" value="${esc(m.dob || '')}"></div>
+            ${dateField('dob', 'Date of birth', m.dob || '')}
           </div>
           <div class="grid2">
             <div class="fld"><label>Mobile</label>
@@ -303,18 +303,20 @@ async function editMember(m, depts, timetables) {
               <input class="inp" name="designation" value="${esc(m.designation || '')}" placeholder="Sr. Teacher"></div>
           </div>
           <div class="grid2">
-            <div class="fld"><label>Date joined</label>
-              <input type="date" class="inp" name="joined_on" value="${esc(m.joined_on || '')}"></div>
+            ${dateField('joined_on', 'Date joined', m.joined_on || '')}
             <div class="fld"><label>Status</label>
               <select class="inp" name="status">
                 ${['Active', 'Inactive', 'On Leave'].map((s) => `<option ${m.status === s ? 'selected' : ''}>${s}</option>`).join('')}
               </select></div>
           </div>
-          <div class="fld"><label>Timetable</label>
-            <select class="inp" name="timetable_id">
+          <div class="fld"><label>Shift</label>
+            <select class="inp" name="shift_id">
               <option value="">Use the department default</option>
-              ${opt(timetables, m.timetable_id)}
-            </select></div>
+              ${opt(timetables, m.shift_id)}
+            </select>
+            <div class="hint">Changing this closes the current assignment today and opens a
+              new one, so last month still recomputes against the shift they were actually on.
+            </div></div>
 
           <div class="divider"></div>
           <h4 style="font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--ink-3);margin-bottom:12px">Terminal credentials</h4>
@@ -358,7 +360,8 @@ async function editMember(m, depts, timetables) {
             device_password: f.device_password || null,
             status: f.status || 'Active',
             joined_on: f.joined_on || null,
-            timetable_id: f.timetable_id ? Number(f.timetable_id) : null,
+            shift_id: f.shift_id ? Number(f.shift_id) : null,
+            access_group: Number(m.access_group) || 1,
           };
           await api.saveMember(payload);
           toast('ok', isNew ? 'Member added and queued for the terminal' : 'Member saved');

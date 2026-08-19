@@ -1,403 +1,503 @@
+// Reports — pick a report, set the filters, read the grid, then print, export
+// or email it.
+//
+// The grid is built from whatever columns the backend says the chosen report
+// has, so all eight reports share one renderer and adding a ninth needs no
+// change here.
+
 import { api } from '../api.js';
 import {
-  icon, esc, table, person, statusTag, hhmm, duration, toast,
-  withBusy, todayIso, monthStart, addDays, loadingTable,
+  icon, esc, toast, modal, confirmDialog, withBusy, duration,
+  todayIso, monthStart, statusTag,
 } from '../ui.js';
+import { dateField, wireDateFields, bsPretty, adPretty } from '../nepali.js';
 
-const TYPES = [
-  { key: 'general', name: 'General Attendance', hint: 'One row per member with totals for the period' },
-  { key: 'daywise', name: 'Day-wise', hint: 'Everyone’s in and out for one chosen date' },
-  { key: 'individual', name: 'Individual', hint: 'Day-by-day detail for a single member of staff' },
-  { key: 'monthly', name: 'Monthly Grid', hint: 'Calendar grid of the whole period, ready for payroll' },
-  { key: 'department', name: 'Department-wise', hint: 'Rolled up by department' },
-  { key: 'late', name: 'Late Arrivals', hint: 'Only the exceptions' },
-  { key: 'absent', name: 'Absentees', hint: 'Days with no attendance recorded' },
-  { key: 'overtime', name: 'Overtime', hint: 'Hours worked beyond the end of duty' },
-];
+const PAGE_SIZE = 100;
+
+/** Render one cell according to the column's declared kind. */
+function cell(value, kind) {
+  if (value === null || value === undefined || value === '') return '<span class="dim">—</span>';
+  switch (kind) {
+    case 'mins': {
+      const n = Number(value);
+      return Number.isFinite(n) && n !== 0 ? esc(duration(n)) : '<span class="dim">—</span>';
+    }
+    case 'pct': {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return '<span class="dim">—</span>';
+      const tone = n >= 95 ? 'g' : n >= 85 ? 'y' : 'r';
+      return `<span class="tag ${tone}">${n.toFixed(1)}%</span>`;
+    }
+    case 'status':
+      return statusTag(String(value));
+    case 'time':
+      return `<span class="mono">${esc(String(value).slice(0, 5))}</span>`;
+    case 'date': {
+      // Nepali first, English underneath: the school works from the BS date.
+      const bs = bsPretty(String(value));
+      return bs
+        ? `<span class="dcell"><b>${esc(bs)}</b><i>${esc(adPretty(String(value)))}</i></span>`
+        : `<span class="mono">${esc(value)}</span>`;
+    }
+    case 'num':
+      return `<span class="mono">${esc(value)}</span>`;
+    default:
+      return esc(value);
+  }
+}
+
+const isNumeric = (kind) => kind === 'num' || kind === 'mins' || kind === 'pct';
 
 export default {
   async mount(host) {
-    const [depts, members, settings] = await Promise.all([
-      api.listDepartments(), api.listMembers(), api.getSettings().catch(() => ({})),
+    const [kinds, depts, members] = await Promise.all([
+      api.reportKinds(),
+      api.listDepartments(),
+      api.listMembers(),
     ]);
 
-    let type = 'general';
-    const today = todayIso();
+    let key = kinds[0]?.key || 'general';
+    let result = null;
+    let sortKey = null;
+    let sortDir = 1;
+    let page = 0;
 
     host.innerHTML = `
-      <div class="g-1-2">
-        <div class="card" style="align-self:start">
-          <div class="card-h"><div class="ht"><h3>Report Builder</h3>
-            <p>Choose what to produce</p></div></div>
-          <div class="card-b">
-            <div class="fld"><label>Report type</label>
-              <div id="types">
-                ${TYPES.map((t) => `<label class="cb" style="margin-bottom:9px">
-                  <input type="radio" name="rtype" value="${t.key}" ${t.key === type ? 'checked' : ''}>
-                  <div class="ct"><b>${esc(t.name)}</b><span>${esc(t.hint)}</span></div></label>`).join('')}
-              </div>
-            </div>
-            <div class="divider"></div>
-            <div class="fld"><label>Quick period</label>
-              <select class="inp" id="period">
-                <option value="month">This month so far</option>
-                <option value="lastmonth">Last month</option>
-                <option value="week">Last 7 days</option>
-                <option value="today">Today</option>
-                <option value="custom">Custom range</option>
-              </select></div>
-            <div class="grid2">
-              <div class="fld"><label>From</label>
-                <input type="date" class="inp" id="from" value="${monthStart(today)}"></div>
-              <div class="fld"><label>To</label>
-                <input type="date" class="inp" id="to" value="${today}"></div>
-            </div>
-            <div class="fld"><label>Department</label>
-              <select class="inp" id="dept">
-                <option value="">All departments</option>
-                ${depts.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join('')}
-              </select></div>
-            <div class="fld" id="memWrap" style="display:none"><label>Member</label>
-              <select class="inp" id="member">
-                ${members.map((m) => `<option value="${m.id}">${esc(m.full_name)} (${m.enroll_no})</option>`).join('')}
-              </select></div>
-            <div class="fld"><label class="cb"><input type="checkbox" id="withBs">
-              <div class="ct"><b>Show Nepali (BS) dates</b></div></label></div>
-            <button class="btn pri" style="width:100%" id="btnRun">${icon('chart')} Generate</button>
+      <div class="split rep">
+        <div class="card pane-l">
+          <div class="card-h"><div class="ht"><h3>Reports</h3><p>Choose one</p></div></div>
+          <div class="pane-list" id="repList">
+            ${kinds.map((k) => `
+              <button class="pane-item" data-key="${esc(k.key)}">
+                <span class="pi-t"><b>${esc(k.label)}</b></span>
+              </button>`).join('')}
+          </div>
+          <div class="card-b bt">
+            <button class="btn" style="width:100%" id="repBook">
+              ${icon('users')} Email recipients
+            </button>
           </div>
         </div>
 
-        <div>
-          <div class="tbar">
-            <div class="sp"></div>
-            <button class="btn" id="btnPrint">${icon('print')} Print</button>
-            <button class="btn" id="btnCsv">${icon('file')} Export CSV</button>
+        <div class="card pane-r">
+          <div class="toolbar wrap">
+            ${dateField('from', 'From', monthStart(todayIso()), { id: 'fFrom', small: true })}
+            ${dateField('to', 'To', todayIso(), { id: 'fTo', small: true })}
+            <div class="tb-f"><label>Department</label>
+              <select class="inp sm" id="fDept">
+                <option value="">All</option>
+                ${depts.map((d) => `<option value="${d.id}">${esc(d.name)}</option>`).join('')}
+              </select></div>
+            <div class="tb-f"><label>Employee</label>
+              <input class="inp sm" id="fWho" list="whoList" placeholder="Name or AC No.">
+              <datalist id="whoList">
+                ${members.map((m) =>
+                  `<option value="${esc(m.full_name)} (${m.enroll_no})"></option>`).join('')}
+              </datalist></div>
+            <span class="grow"></span>
+            <button class="btn pri sm" id="btnRun">${icon('sync')} Generate</button>
+            <button class="btn sm" id="btnPrint">${icon('file')} Print</button>
+            <button class="btn sm" id="btnExport">${icon('down')} Create report</button>
+            <button class="btn sm" id="btnMail">${icon('mail')} Email</button>
           </div>
-          <div class="card" id="sheet">
-            <div class="card-h">
-              <img src="assets/crest.png" style="height:34px" alt="">
-              <div class="ht"><h3 id="repTitle">General Attendance Report</h3>
-                <p>${esc(settings.school_name || 'Janapremi World School')} · ${esc(settings.school_address || '')}</p></div>
-              <div style="text-align:right;font-size:11px;color:var(--ink-3)">
-                <div id="repRange">—</div><div id="repGen">—</div></div>
-            </div>
-            <div class="card-b" id="summary" style="border-bottom:1px solid var(--line)"></div>
-            <div class="tbl-wrap" style="max-height:calc(100vh - 380px)">
-              <table class="tbl" id="tbl"></table></div>
-            <div class="card-f" style="display:flex;justify-content:space-between;font-size:11px;color:var(--ink-3)">
-              <span>JWS Attendance</span><span id="repCount"></span>
-            </div>
-          </div>
+          <div id="repMeta" class="rep-meta"></div>
+          <div class="grid-wrap" id="repGrid"></div>
+          <div class="pager" id="repPager"></div>
         </div>
       </div>`;
 
-    const $ = (s) => host.querySelector(s);
+    const grid = host.querySelector('#repGrid');
+    const meta = host.querySelector('#repMeta');
+    const pager = host.querySelector('#repPager');
 
-    $('#types').addEventListener('change', (e) => {
-      if (e.target.name !== 'rtype') return;
-      type = e.target.value;
-      $('#memWrap').style.display = type === 'individual' ? 'block' : 'none';
-      run();
-    });
+    /** Turn the toolbar into the filter object the backend expects. */
+    function filters() {
+      const who = host.querySelector('#fWho').value.trim();
+      let memberId = null;
+      if (who) {
+        // The datalist entries end in "(enrolment)". Match on that first, then
+        // fall back to an exact name, so typing a name that two people share
+        // does not silently pick one of them.
+        const byEnroll = /\((\d+)\)\s*$/.exec(who);
+        const found = byEnroll
+          ? members.find((m) => String(m.enroll_no) === byEnroll[1])
+          : members.find((m) => m.full_name.toLowerCase() === who.toLowerCase());
+        if (!found) throw new Error(`No member of staff matches "${who}".`);
+        memberId = found.id;
+      }
+      const dept = host.querySelector('#fDept').value;
+      return {
+        from: host.querySelector('#fFrom').value,
+        to: host.querySelector('#fTo').value,
+        dept_id: dept ? Number(dept) : null,
+        member_id: memberId,
+      };
+    }
 
-    $('#period').addEventListener('change', () => {
-      const v = $('#period').value;
-      if (v === 'month') { $('#from').value = monthStart(today); $('#to').value = today; }
-      else if (v === 'lastmonth') {
-        const d = new Date(`${today}T00:00:00`);
-        d.setDate(1); d.setMonth(d.getMonth() - 1);
-        const start = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`;
-        const end = new Date(d.getFullYear(), d.getMonth() + 1, 0);
-        $('#from').value = start;
-        $('#to').value = `${end.getFullYear()}-${String(end.getMonth() + 1).padStart(2, '0')}-${String(end.getDate()).padStart(2, '0')}`;
-      } else if (v === 'week') { $('#from').value = addDays(today, -6); $('#to').value = today; }
-      else if (v === 'today') { $('#from').value = today; $('#to').value = today; }
-      if (v !== 'custom') run();
-    });
+    function paintList() {
+      host.querySelectorAll('#repList [data-key]').forEach((b) =>
+        b.classList.toggle('on', b.dataset.key === key));
+    }
 
-    $('#dept').addEventListener('change', run);
-    $('#member').addEventListener('change', run);
-    $('#btnRun').addEventListener('click', (e) => withBusy(e.currentTarget, run).catch(() => {}));
+    function sortedRows() {
+      if (!result) return [];
+      if (!sortKey) return result.rows;
+      const kind = result.columns.find((c) => c.key === sortKey)?.kind;
+      const numeric = isNumeric(kind);
+      return [...result.rows].sort((a, b) => {
+        const x = a[sortKey];
+        const y = b[sortKey];
+        // Blanks sort last whichever way the column is pointing, so an empty
+        // clock-out never displaces a real one at the top.
+        if (x === null || x === undefined || x === '') return 1;
+        if (y === null || y === undefined || y === '') return -1;
+        const cmp = numeric
+          ? Number(x) - Number(y)
+          : String(x).localeCompare(String(y), undefined, { numeric: true });
+        return cmp * sortDir;
+      });
+    }
 
-    $('#btnPrint').addEventListener('click', () => window.print());
+    function paintGrid() {
+      if (!result) {
+        grid.innerHTML = `<div class="empty" style="padding:52px 20px">
+          <div class="ei">${icon('chart')}</div>
+          <b>Nothing generated yet</b>
+          <p>Set the dates and press Generate.</p></div>`;
+        meta.innerHTML = '';
+        pager.innerHTML = '';
+        return;
+      }
 
-    $('#btnCsv').addEventListener('click', (e) =>
-      withBusy(e.currentTarget, async () => {
-        const csv = await api.exportCsv(
-          $('#from').value, $('#to').value,
-          Number($('#dept').value) || null, $('#withBs').checked,
-        );
-        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = `jws-attendance-${$('#from').value}-to-${$('#to').value}.csv`;
-        a.click();
-        setTimeout(() => URL.revokeObjectURL(a.href), 2000);
-        toast('ok', 'CSV downloaded');
-      }).catch(() => {}),
-    );
+      const rows = sortedRows();
+      const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+      page = Math.min(page, pages - 1);
+      const slice = rows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+
+      meta.innerHTML = `<b>${esc(result.title)}</b>
+        <span>${esc(result.subtitle)} · ${rows.length} row${rows.length === 1 ? '' : 's'}</span>`;
+
+      if (!rows.length) {
+        grid.innerHTML = `<div class="empty" style="padding:52px 20px">
+          <div class="ei">${icon('search')}</div>
+          <b>No records in this period</b>
+          <p>Try a wider date range, or check that attendance has been recalculated.</p></div>`;
+        pager.innerHTML = '';
+        return;
+      }
+
+      const head = result.columns.map((c) => `
+        <th class="${isNumeric(c.kind) ? 'n' : ''}${sortKey === c.key ? ' sorted' : ''}"
+            data-sort="${esc(c.key)}">
+          ${esc(c.label)}${sortKey === c.key ? (sortDir === 1 ? ' ▲' : ' ▼') : ''}
+        </th>`).join('');
+
+      const bodyRows = slice.map((r) => `<tr>${result.columns.map((c) =>
+        `<td class="${isNumeric(c.kind) ? 'n' : ''}">${cell(r[c.key], c.kind)}</td>`).join('')}</tr>`).join('');
+
+      const hasTotals = result.totals && Object.keys(result.totals).length;
+      const foot = hasTotals
+        ? `<tfoot><tr>${result.columns.map((c, i) =>
+            i === 0
+              ? '<td><b>Total</b></td>'
+              : `<td class="${isNumeric(c.kind) ? 'n' : ''}"><b>${
+                  result.totals[c.key] !== undefined ? cell(result.totals[c.key], c.kind) : ''
+                }</b></td>`).join('')}</tr></tfoot>`
+        : '';
+
+      grid.innerHTML = `<table class="tbl grid">
+        <thead><tr>${head}</tr></thead><tbody>${bodyRows}</tbody>${foot}</table>`;
+
+      pager.innerHTML = pages > 1
+        ? `<button class="btn sm" id="pPrev" ${page === 0 ? 'disabled' : ''}>Previous</button>
+           <span>Page ${page + 1} of ${pages}</span>
+           <button class="btn sm" id="pNext" ${page >= pages - 1 ? 'disabled' : ''}>Next</button>`
+        : '';
+    }
 
     async function run() {
-      const from = $('#from').value;
-      const to = $('#to').value;
-      const deptId = Number($('#dept').value) || null;
-      const memberId = Number($('#member').value) || null;
-      const withBs = $('#withBs').checked;
-
-      if (!from || !to) return toast('err', 'Choose both a start and an end date.');
-      if (to < from) return toast('err', 'The end date is before the start date.');
-
-      const meta = TYPES.find((t) => t.key === type);
-      $('#repTitle').textContent = `${meta.name} Report`;
-      $('#repRange').textContent = from === to ? from : `${from} to ${to}`;
-      $('#repGen').textContent = `Generated ${today}`;
-      loadingTable($('#tbl'), 8);
-      $('#summary').innerHTML = '';
-
-      try {
-        if (type === 'general') return await general(from, to, deptId);
-        if (type === 'department') return await byDepartment(from, to);
-        if (type === 'individual') return await individual(from, to, memberId, withBs);
-        if (type === 'monthly') return await monthly(from, to, deptId);
-        return await detail(from, to, deptId, withBs, type);
-      } catch (e) {
-        $('#tbl').innerHTML = `<tbody><tr><td><div class="empty">
-          <div class="ei">${icon('warn')}</div><b>Could not build this report</b>
-          <p>${esc(e.message)}</p></div></td></tr></tbody>`;
-      }
+      const f = filters();
+      result = await api.runReport(key, f);
+      sortKey = null;
+      page = 0;
+      paintGrid();
     }
 
-    const stat = (label, value) => `
-      <div style="padding:11px 13px;background:#FAFBFC;border:1px solid var(--line);
-        border-radius:9px;margin-bottom:10px">
-        <div style="font-size:10.5px;color:var(--ink-3);text-transform:uppercase;
-          letter-spacing:.05em;font-weight:650">${esc(label)}</div>
-        <div style="font-size:18px;font-weight:700;letter-spacing:-.02em;margin-top:3px">${value}</div></div>`;
-
-    const setCount = (n, noun = 'row') =>
-      ($('#repCount').textContent = `${n} ${noun}${n === 1 ? '' : 's'}`);
-
-    // --- general ---
-    async function general(from, to, deptId) {
-      const rows = await api.reportSummary(from, to, deptId);
-      const tot = rows.reduce((a, r) => ({
-        present: a.present + r.present, late: a.late + r.late,
-        absent: a.absent + r.absent, ot: a.ot + r.ot_min,
-      }), { present: 0, late: 0, absent: 0, ot: 0 });
-      const avg = rows.length ? rows.reduce((a, r) => a + r.rate, 0) / rows.length : 0;
-
-      $('#summary').innerHTML = `<div class="grid4">
-        ${stat('Staff', rows.length)}${stat('Working days', rows[0]?.working_days ?? 0)}
-        ${stat('Average attendance', `${avg.toFixed(1)}%`)}${stat('Total late', tot.late)}
-        ${stat('Total absent', tot.absent)}${stat('Total overtime', duration(tot.ot))}
-        ${stat('Below 85%', rows.filter((r) => r.rate < 85).length)}
-        ${stat('Perfect attendance', rows.filter((r) => r.rate >= 100).length)}</div>`;
-
-      table($('#tbl'), [
-        { label: '#', cls: 'num mono', get: (_, i) => i + 1 },
-        { label: 'Staff', get: (r) => person(r.full_name, `Enrolment ${r.enroll_no}`, r.enroll_no) },
-        { label: 'Department', get: (r) => esc(r.dept_name || '—') },
-        { label: 'Designation', get: (r) => esc(r.designation || '—') },
-        { label: 'Days', cls: 'num', get: (r) => r.working_days },
-        { label: 'Present', cls: 'num', get: (r) => `<b>${r.present}</b>` },
-        { label: 'Late', cls: 'num', get: (r) => r.late || '—' },
-        { label: 'Half', cls: 'num', get: (r) => r.half_day || '—' },
-        { label: 'Absent', cls: 'num', get: (r) => r.absent || '—' },
-        { label: 'Leave', cls: 'num', get: (r) => r.leave || '—' },
-        { label: 'Hours', cls: 'num mono', get: (r) => duration(r.worked_min) },
-        { label: 'OT', cls: 'num mono', get: (r) => duration(r.ot_min) },
-        {
-          label: 'Rate', width: '130px',
-          get: (r) => `<div style="display:flex;align-items:center;gap:8px">
-            <div class="bar" style="flex:1"><i style="width:${Math.min(100, r.rate)}%;
-              background:${r.rate >= 90 ? '#1F9D55' : r.rate >= 80 ? '#C9820B' : '#D64545'}"></i></div>
-            <b style="font-size:12px;width:42px;text-align:right">${r.rate.toFixed(1)}%</b></div>`,
-        },
-      ], rows, { empty: 'No staff in this selection' });
-      setCount(rows.length, 'member');
-    }
-
-    // --- department ---
-    async function byDepartment(from, to) {
-      const all = await api.reportSummary(from, to, null);
-      const grouped = depts.map((d) => {
-        const rows = all.filter((r) => r.dept_name === d.name);
-        const sum = rows.reduce((a, r) => ({
-          present: a.present + r.present, late: a.late + r.late,
-          half: a.half + r.half_day, absent: a.absent + r.absent,
-          leave: a.leave + r.leave, days: a.days + r.working_days,
-        }), { present: 0, late: 0, half: 0, absent: 0, leave: 0, days: 0 });
-        const rate = sum.days ? ((sum.present + sum.late + sum.half * 0.5) / sum.days) * 100 : 0;
-        return { ...d, staff: rows.length, ...sum, rate };
-      });
-
-      const best = [...grouped].filter((g) => g.staff).sort((a, b) => b.rate - a.rate)[0];
-      $('#summary').innerHTML = `<div class="grid4">
-        ${stat('Departments', grouped.filter((g) => g.staff).length)}
-        ${stat('Total staff', all.length)}
-        ${stat('Average', `${(grouped.reduce((a, g) => a + g.rate, 0) / (grouped.length || 1)).toFixed(1)}%`)}
-        ${stat('Best', esc(best?.name || '—'))}</div>`;
-
-      table($('#tbl'), [
-        { label: 'Code', get: (g) => `<span class="tag n" style="background:${esc(g.colour)}18;color:${esc(g.colour)}">${esc(g.code)}</span>` },
-        { label: 'Department', get: (g) => `<b>${esc(g.name)}</b>` },
-        { label: 'Head', get: (g) => esc(g.head_name || '—') },
-        { label: 'Staff', cls: 'num', get: (g) => g.staff },
-        { label: 'Member-days', cls: 'num', get: (g) => g.days },
-        { label: 'Present', cls: 'num', get: (g) => g.present },
-        { label: 'Late', cls: 'num', get: (g) => g.late },
-        { label: 'Absent', cls: 'num', get: (g) => g.absent },
-        { label: 'Leave', cls: 'num', get: (g) => g.leave },
-        {
-          label: 'Rate', width: '150px',
-          get: (g) => `<div style="display:flex;align-items:center;gap:9px">
-            <div class="bar" style="flex:1"><i style="width:${Math.min(100, g.rate)}%;background:${esc(g.colour)}"></i></div>
-            <b style="font-size:12px;width:42px;text-align:right">${g.rate.toFixed(1)}%</b></div>`,
-        },
-      ], grouped, { empty: 'No departments' });
-      setCount(grouped.length, 'department');
-    }
-
-    // --- individual ---
-    async function individual(from, to, memberId, withBs) {
-      if (!memberId) throw new Error('Choose a member of staff first.');
-      const m = members.find((x) => x.id === memberId);
-      const rows = await api.attendance(from, to, null, memberId, withBs);
-      const worked = rows.filter((r) => ['Present', 'Late', 'HalfDay'].includes(r.status));
-      const workDays = rows.filter((r) => !['Holiday', 'WeeklyOff'].includes(r.status)).length;
-      const rate = workDays ? (worked.length / workDays) * 100 : 0;
-
-      $('#summary').innerHTML = `
-        <div style="display:flex;align-items:center;gap:14px;margin-bottom:14px">
-          <div style="width:44px;height:44px;border-radius:50%;background:var(--brand);color:#fff;
-            display:grid;place-items:center;font-weight:700">${esc((m.full_name[0] || '') + (m.full_name.split(' ')[1]?.[0] || ''))}</div>
-          <div style="flex:1"><b style="font-size:15px">${esc(m.full_name)}</b>
-            <div style="font-size:12px;color:var(--ink-3)">Enrolment ${m.enroll_no} ·
-              ${esc(m.designation || '')} · ${esc(m.dept_name || '')}</div></div>
-        </div>
-        <div class="grid4">
-          ${stat('Working days', workDays)}${stat('Present', rows.filter((r) => r.status === 'Present').length)}
-          ${stat('Late', rows.filter((r) => r.status === 'Late').length)}
-          ${stat('Absent', rows.filter((r) => r.status === 'Absent').length)}
-          ${stat('Total hours', duration(rows.reduce((a, r) => a + r.worked_min, 0)))}
-          ${stat('Overtime', duration(rows.reduce((a, r) => a + r.ot_min, 0)))}
-          ${stat('Late minutes', rows.reduce((a, r) => a + r.late_min, 0))}
-          ${stat('Attendance', `${rate.toFixed(1)}%`)}</div>`;
-
-      table($('#tbl'), [
-        { label: 'Date', cls: 'mono', get: (r) => esc(r.work_date) },
-        ...(withBs ? [{ label: 'Nepali date', get: (r) => esc(r.work_date_bs || '—') }] : []),
-        { label: 'Day', get: (r) => new Date(`${r.work_date}T00:00:00`).toLocaleDateString('en-GB', { weekday: 'short' }) },
-        { label: 'In', cls: 'mono', get: (r) => hhmm(r.in_time) },
-        { label: 'Out', cls: 'mono', get: (r) => hhmm(r.out_time) },
-        { label: 'Worked', cls: 'num mono', get: (r) => duration(r.worked_min) },
-        { label: 'Late', cls: 'num', get: (r) => r.late_min || '—' },
-        { label: 'OT', cls: 'num mono', get: (r) => (r.ot_min ? duration(r.ot_min) : '—') },
-        { label: 'Status', get: (r) => statusTag(r.status) },
-        { label: 'Remark', get: (r) => `<span style="color:var(--ink-3)">${esc(r.remark || '')}</span>` },
-      ], rows, { empty: 'No records in this period' });
-      setCount(rows.length, 'day');
-    }
-
-    // --- monthly grid ---
-    async function monthly(from, to, deptId) {
-      const rows = await api.attendance(from, to, deptId, null, false);
-      const dates = [...new Set(rows.map((r) => r.work_date))].sort();
-      const byMember = new Map();
-      for (const r of rows) {
-        if (!byMember.has(r.member_id)) {
-          byMember.set(r.member_id, { name: r.full_name, enroll: r.enroll_no, days: {} });
+    host.querySelector('#repList').addEventListener('click', async (e) => {
+      const b = e.target.closest('[data-key]');
+      if (!b) return;
+      key = b.dataset.key;
+      paintList();
+      // Switching report with a grid already on screen should show the new one,
+      // not leave the old figures under a new title.
+      if (result) {
+        try {
+          await run();
+        } catch (err) {
+          toast('err', err.message || String(err));
         }
-        byMember.get(r.member_id).days[r.work_date] = r.status;
       }
-      const people = [...byMember.values()];
+    });
 
-      $('#summary').innerHTML = `<div class="grid4">
-          ${stat('Period', `${from} → ${to}`)}${stat('Days shown', dates.length)}
-          ${stat('Staff', people.length)}${stat('Records', rows.length)}</div>
-        <div class="legend" style="margin-top:12px">
-          <div class="li"><i style="background:#1F9D55"></i>Present (P)</div>
-          <div class="li"><i style="background:#C9820B"></i>Late (L)</div>
-          <div class="li"><i style="background:#D64545"></i>Absent (A)</div>
-          <div class="li"><i style="background:#6B4EBB"></i>Leave (V)</div>
-          <div class="li"><i style="background:#E7E9EC"></i>Holiday / weekly off (H)</div></div>`;
+    // withBusy already reports the failure; catching again here would show the
+    // same message twice.
+    host.querySelector('#btnRun').addEventListener('click', (e) =>
+      withBusy(e.currentTarget, run).catch(() => {}));
 
-      const MARK = {
-        Present: ['P', '#1F9D55'], Late: ['L', '#C9820B'], HalfDay: ['½', '#C9820B'],
-        Absent: ['A', '#D64545'], Leave: ['V', '#6B4EBB'],
-        Holiday: ['H', '#868D96'], WeeklyOff: ['H', '#868D96'], MissingPunch: ['?', '#868D96'],
-      };
-
-      $('#tbl').innerHTML =
-        `<thead><tr><th>Staff</th>
-          ${dates.map((d) => `<th class="ctr" style="padding:9px 4px">${d.slice(8)}</th>`).join('')}
-          <th class="num">P</th><th class="num">L</th><th class="num">A</th><th class="num">%</th></tr></thead>
-        <tbody>${people.map((p) => {
-          let P = 0, L = 0, A = 0, days = 0;
-          const cells = dates.map((d) => {
-            const st = p.days[d];
-            if (!st) return '<td class="ctr">—</td>';
-            const [mark, colour] = MARK[st] || ['?', '#868D96'];
-            if (!['Holiday', 'WeeklyOff'].includes(st)) days++;
-            if (st === 'Present') P++;
-            else if (st === 'Late' || st === 'HalfDay') { L++; P++; }
-            else if (st === 'Absent' || st === 'MissingPunch') A++;
-            return `<td class="ctr" style="padding:7px 4px">
-              <span class="mcell" style="background:${colour}1a;color:${colour}" title="${esc(d)} — ${esc(st)}">${mark}</span></td>`;
-          }).join('');
-          const pc = days ? ((P / days) * 100).toFixed(0) : '0';
-          return `<tr><td style="white-space:nowrap"><b>${esc(p.name)}</b>
-            <div style="font-size:10.5px;color:var(--ink-3)">Enrolment ${p.enroll}</div></td>
-            ${cells}<td class="num"><b>${P}</b></td><td class="num">${L}</td><td class="num">${A}</td>
-            <td class="num"><span class="tag ${pc >= 90 ? 'g' : pc >= 80 ? 'y' : 'r'}">${pc}%</span></td></tr>`;
-        }).join('')}</tbody>`;
-
-      if (!people.length) {
-        $('#tbl').innerHTML = `<tbody><tr><td><div class="empty">
-          <div class="ei">${icon('chart')}</div><b>No records in this period</b>
-          <p>Fetch punch records, or recalculate attendance, and try again.</p></div></td></tr></tbody>`;
+    grid.addEventListener('click', (e) => {
+      const th = e.target.closest('[data-sort]');
+      if (th) {
+        const k = th.dataset.sort;
+        sortDir = sortKey === k ? -sortDir : 1;
+        sortKey = k;
+        paintGrid();
+        return;
       }
-      setCount(people.length, 'member');
-    }
+      if (e.target.id === 'pPrev') { page--; paintGrid(); }
+      if (e.target.id === 'pNext') { page++; paintGrid(); }
+    });
+    pager.addEventListener('click', (e) => {
+      if (e.target.id === 'pPrev') { page--; paintGrid(); }
+      if (e.target.id === 'pNext') { page++; paintGrid(); }
+    });
 
-    // --- day-wise / late / absent / overtime ---
-    async function detail(from, to, deptId, withBs, kind) {
-      let rows = await api.attendance(from, to, deptId, null, withBs);
-      if (kind === 'late') rows = rows.filter((r) => r.late_min > 0 || r.early_min > 0);
-      if (kind === 'absent') rows = rows.filter((r) => ['Absent', 'MissingPunch', 'Leave'].includes(r.status));
-      if (kind === 'overtime') rows = rows.filter((r) => r.ot_min > 0);
+    // --- print ---
+    host.querySelector('#btnPrint').addEventListener('click', () => {
+      if (!result) return toast('inf', 'Generate the report first.');
+      const w = window.open('', '_blank');
+      if (!w) return toast('err', 'The print window was blocked.');
+      // Reuse the backend's own HTML rendering so the printed sheet and the
+      // emailed one are the same document.
+      api.exportReport(key, filters(), 'html', tempPath('print', 'html'))
+        .then(async (p) => {
+          w.document.write(`<p style="font:14px sans-serif">Saved to ${esc(p)} — opening…</p>`);
+          await api.openPath(p);
+          w.close();
+        })
+        .catch((e) => {
+          w.close();
+          toast('err', e.message);
+        });
+    });
 
-      const totals = {
-        late: rows.reduce((a, r) => a + r.late_min, 0),
-        ot: rows.reduce((a, r) => a + r.ot_min, 0),
-        staff: new Set(rows.map((r) => r.member_id)).size,
-      };
-      $('#summary').innerHTML = `<div class="grid4">
-        ${stat('Records', rows.length)}${stat('Staff affected', totals.staff)}
-        ${stat('Total late', `${totals.late} min`)}${stat('Total overtime', duration(totals.ot))}</div>`;
+    const tempPath = (name, ext) =>
+      `${name}-${key}-${todayIso()}.${ext}`;
 
-      table($('#tbl'), [
-        { label: 'Date', cls: 'mono', get: (r) => esc(r.work_date) },
-        ...(withBs ? [{ label: 'Nepali date', get: (r) => esc(r.work_date_bs || '—') }] : []),
-        { label: 'Staff', get: (r) => person(r.full_name, `Enrolment ${r.enroll_no}`, r.enroll_no) },
-        { label: 'Department', get: (r) => esc(r.dept_name || '—') },
-        { label: 'In', cls: 'mono', get: (r) => hhmm(r.in_time) },
-        { label: 'Out', cls: 'mono', get: (r) => hhmm(r.out_time) },
-        { label: 'Worked', cls: 'num mono', get: (r) => duration(r.worked_min) },
-        { label: 'Late', cls: 'num', get: (r) => r.late_min || '—' },
-        { label: 'Early', cls: 'num', get: (r) => r.early_min || '—' },
-        { label: 'OT', cls: 'num mono', get: (r) => (r.ot_min ? duration(r.ot_min) : '—') },
-        { label: 'Status', get: (r) => statusTag(r.status) },
-      ], rows, {
-        empty: kind === 'late' ? 'No late arrivals in this period'
-          : kind === 'absent' ? 'No absences in this period'
-            : kind === 'overtime' ? 'No overtime in this period'
-              : 'No records in this period',
-        emptyHint: 'That is a good result, but check the dates if it looks wrong.',
+    // --- export ---
+    host.querySelector('#btnExport').addEventListener('click', async () => {
+      if (!result) return toast('inf', 'Generate the report first.');
+      const fmt = await modal({
+        title: 'Create report',
+        subtitle: result.title,
+        body: `<div class="fld"><label>Format</label>
+            <select class="inp" name="fmt">
+              <option value="csv">Excel / CSV</option>
+              <option value="html">Web page (HTML)</option>
+              <option value="pdf">Printable page (PDF via print dialog)</option>
+            </select></div>
+          <div class="fld"><label>File name</label>
+            <input class="inp" name="path" value="${esc(tempPath('report', 'csv'))}"></div>
+          <div class="note b">${icon('info')}<div>
+            The file is written next to the app's data folder unless you type a
+            full path such as D:\\Reports\\august.csv
+          </div></div>`,
+        buttons: [
+          { label: 'Cancel', value: null },
+          {
+            label: 'Create', kind: 'pri',
+            onClick: async (ov) => {
+              const f = ov.querySelector('[name=fmt]').value;
+              let p = ov.querySelector('[name=path]').value.trim();
+              if (!p) throw new Error('Give the file a name.');
+              // Keep the extension honest, so Excel opens what it expects.
+              const want = f === 'csv' ? '.csv' : '.html';
+              if (!p.toLowerCase().endsWith(want)) p = p.replace(/\.[^.\\/]*$/, '') + want;
+              return api.exportReport(key, filters(), f, p);
+            },
+          },
+        ],
       });
-      setCount(rows.length);
+      if (fmt) {
+        toast('ok', `Saved to ${fmt}`);
+        await api.openPath(fmt).catch(() => {});
+      }
+    });
+
+    // --- email ---
+    host.querySelector('#btnMail').addEventListener('click', async () => {
+      const people = (await api.listRecipients()).filter((r) => r.active);
+      if (!people.length) {
+        if (await confirmDialog('No recipients yet',
+          'Nobody has been added to the email list. Open the recipient book now?',
+          'Open list', 'pri')) openBook();
+        return;
+      }
+
+      const f = filters();
+      const picked = await modal({
+        title: 'Email this report',
+        subtitle: `${kinds.find((k) => k.key === key)?.label} · ${f.from} to ${f.to}`,
+        wide: true,
+        body: `
+          <div class="fld"><label>Send to</label>
+            <div class="picklist">
+              ${people.map((p) => `
+                <label class="cb">
+                  <input type="checkbox" data-rid="${p.id}"
+                    ${p.reports.includes(key) ? 'checked' : ''}>
+                  <div class="ct"><b>${esc(p.name)}</b>
+                    <span>${esc(p.email)}${p.role ? ` · ${esc(p.role)}` : ''}${
+                      p.dept_name ? ` · ${esc(p.dept_name)} only` : ''}</span></div>
+                </label>`).join('')}
+            </div></div>
+          <div class="fld"><label>Covering note (optional)</label>
+            <textarea class="inp" name="note" rows="3"
+              placeholder="Anything you want said above the table"></textarea></div>
+          <div class="note b">${icon('info')}<div>
+            Anyone tied to a department receives the same report narrowed to their
+            own staff. Ticked by default are the people already on this report's list.
+          </div></div>`,
+        buttons: [
+          { label: 'Cancel', value: null },
+          {
+            label: 'Send', kind: 'pri',
+            onClick: async (ov) => {
+              const ids = [...ov.querySelectorAll('[data-rid]:checked')]
+                .map((c) => Number(c.dataset.rid));
+              if (!ids.length) throw new Error('Tick at least one person.');
+              const note = ov.querySelector('[name=note]').value;
+              return api.sendReportEmail(key, f, ids, note);
+            },
+          },
+        ],
+      });
+
+      if (!picked) return;
+      if (picked.failed) {
+        toast('err', `${picked.sent} sent, ${picked.failed} failed. ${picked.details.at(-1) || ''}`);
+      } else {
+        toast('ok', `Sent to ${picked.sent} recipient${picked.sent === 1 ? '' : 's'}`);
+      }
+    });
+
+    // --- the recipient book ---
+    async function openBook() {
+      const refresh = async () => {
+        const people = await api.listRecipients();
+        return people.length
+          ? people.map((p) => `
+              <div class="rcp">
+                <div class="rc-t">
+                  <b>${esc(p.name)}${p.active ? '' : ' (off)'}</b>
+                  <span>${esc(p.email)}</span>
+                  <span class="dim">${esc(p.role || '')}${
+                    p.dept_name ? ` · ${esc(p.dept_name)}` : ' · whole school'}</span>
+                  <span class="dim">${p.reports.length
+                    ? `${p.reports.length} report${p.reports.length === 1 ? '' : 's'} on their list`
+                    : 'Not on any list'}</span>
+                </div>
+                <button class="btn sm" data-edit="${p.id}">Edit</button>
+                <button class="btn sm dan" data-del="${p.id}">Delete</button>
+              </div>`).join('')
+          : '<div class="pane-empty">Nobody added yet.</div>';
+      };
+
+      await modal({
+        title: 'Report recipients',
+        subtitle: 'School officials who receive attendance reports',
+        wide: true,
+        body: `<div id="rcpList">${await refresh()}</div>
+          <button class="btn pri" id="rcpAdd" style="margin-top:12px">
+            ${icon('plus')} Add recipient</button>`,
+        buttons: [{ label: 'Close', value: null }],
+        onMount: (ov) => {
+          const relist = async () => {
+            ov.querySelector('#rcpList').innerHTML = await refresh();
+          };
+
+          ov.addEventListener('click', async (e) => {
+            const del = e.target.closest('[data-del]');
+            if (del) {
+              await api.deleteRecipient(Number(del.dataset.del));
+              await relist();
+              return;
+            }
+            const ed = e.target.closest('[data-edit]');
+            const add = e.target.closest('#rcpAdd');
+            if (!ed && !add) return;
+
+            const all = await api.listRecipients();
+            const r = ed
+              ? all.find((x) => x.id === Number(ed.dataset.edit))
+              : { id: null, name: '', email: '', role: '', dept_id: null, reports: [], active: true };
+
+            const saved = await modal({
+              title: r.id ? 'Edit recipient' : 'Add recipient',
+              subtitle: 'Who receives reports, and which ones',
+              body: `
+                <div class="grid2">
+                  <div class="fld"><label>Name</label>
+                    <input class="inp" name="name" value="${esc(r.name)}"></div>
+                  <div class="fld"><label>Role</label>
+                    <input class="inp" name="role" value="${esc(r.role)}"
+                      placeholder="Principal, Accountant…"></div>
+                </div>
+                <div class="fld"><label>Email address</label>
+                  <input class="inp" name="email" type="email" value="${esc(r.email)}"></div>
+                <div class="fld"><label>Sees</label>
+                  <select class="inp" name="dept">
+                    <option value="">The whole school</option>
+                    ${depts.map((d) => `<option value="${d.id}" ${
+                      r.dept_id === d.id ? 'selected' : ''}>${esc(d.name)} only</option>`).join('')}
+                  </select></div>
+                <div class="fld"><label>On the list for</label>
+                  <div class="picklist">
+                    ${kinds.map((k) => `
+                      <label class="cb">
+                        <input type="checkbox" data-rep="${esc(k.key)}"
+                          ${r.reports.includes(k.key) ? 'checked' : ''}>
+                        <div class="ct"><b>${esc(k.label)}</b></div>
+                      </label>`).join('')}
+                  </div></div>
+                <label class="cb"><input type="checkbox" name="active" ${r.active ? 'checked' : ''}>
+                  <div class="ct"><b>Active</b>
+                    <span>Switch off to keep the address without sending to it</span></div></label>`,
+              buttons: [
+                { label: 'Cancel', value: null },
+                {
+                  label: 'Save', kind: 'pri',
+                  onClick: async (o2) => {
+                    const g = (n) => o2.querySelector(`[name=${n}]`);
+                    const dept = g('dept').value;
+                    return api.saveRecipient({
+                      id: r.id,
+                      name: g('name').value,
+                      email: g('email').value,
+                      role: g('role').value,
+                      dept_id: dept ? Number(dept) : null,
+                      reports: [...o2.querySelectorAll('[data-rep]:checked')]
+                        .map((c) => c.dataset.rep),
+                      active: g('active').checked,
+                    });
+                  },
+                },
+              ],
+            });
+            if (saved) await relist();
+          });
+        },
+      });
     }
 
-    await run();
+    host.querySelector('#repBook').addEventListener('click', openBook);
+
+    wireDateFields(host);
+    paintList();
+    paintGrid();
+    try {
+      await run();
+    } catch {
+      /* an empty database is not an error worth a toast on first open */
+    }
   },
 };

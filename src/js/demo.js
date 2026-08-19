@@ -51,6 +51,27 @@ function rng(seed) {
 const iso = (d) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
+
+import { BS_TABLE } from './bs-table.generated.js';
+
+const REPORT_KINDS = [
+  ['daily_stat', 'Daily Attendance Statistic Report'],
+  ['general', 'Attendance General Report'],
+  ['dept_stat', 'Depart Attendance Statistic Report'],
+  ['duty_timetable', "Staff's On-Duty/Off-Duty Timetable"],
+  ['daily_shifts', 'Daily Attendance Shifts'],
+  ['daily_ot', 'Daily Attendance OT Report'],
+  ['ot_summary', 'Summary of Overtime'],
+  ['daily_overtime', 'Daily Overtime'],
+];
+
+const todayIso = () => iso(new Date());
+const addDaysIso = (d, n) => {
+  const x = new Date(`${d}T00:00:00`);
+  x.setDate(x.getDate() + n);
+  return iso(x);
+};
+
 export function createDemo() {
   const rand = rng(20260819);
   const pick = (a) => a[Math.floor(rand() * a.length)];
@@ -211,6 +232,37 @@ export function createDemo() {
     { id: 4, name: 'Night Security (7 days)', assigned: 0, days: 'NGT,NGT,NGT,NGT,NGT,NGT,NGT' },
   ];
 
+
+  // The full rule set, matching the shape the desktop build stores in one row.
+  const demoRules = {
+    unit_name: 'Janapremi World School', unit_abbr: 'JWS',
+    week_start: 0, month_start_day: 1, cross_day_belongs_to_first: true,
+    longest_zone_min: 1440, shortest_zone_min: 30, least_shift_interval_min: 30,
+    out_state: 'as_out', ot_state: 'as_out',
+    workday_minutes: 420, late_after_min: 10, early_after_min: 10,
+    no_clock_in_enabled: true, no_clock_in_as: 'Absent', no_clock_in_min: 0,
+    no_clock_out_enabled: true, no_clock_out_as: 'EarlyLeave', no_clock_out_min: 0,
+    late_to_absent_enabled: true, late_to_absent_min: 240,
+    early_to_absent_enabled: true, early_to_absent_min: 240,
+    half_day_after_min: 120, min_full_day_min: 350,
+    ot_after_shift_enabled: true, ot_after_shift_min: 30,
+    ot_before_shift_enabled: false, ot_before_shift_min: 30, ot_max_daily_min: 240,
+    dedupe_secs: 60, lone_punch_half_day: true,
+    sym_normal: 'P', sym_late: 'L', sym_early: 'E', sym_absent: 'A', sym_ot: 'O',
+    sym_leave: 'V', sym_holiday: 'H', sym_half_day: 'HD', sym_missing: '?',
+    min_unit: 0.5, min_unit_basis: 'workday', rounding: 'off',
+    acc_by_times: false, round_at_acc: true, group_by_periods: false,
+    weekend_days: [false, false, false, false, false, false, true],
+    weekend_as_ot: true, weekend_symbol: 'W', weekend_colour: '#94A3B8',
+  };
+
+  const recipients = [
+    { id: 1, name: 'Principal', email: 'principal@jws.edu.np', role: 'Principal',
+      dept_id: null, dept_name: null, reports: ['daily_stat', 'general'], active: true },
+    { id: 2, name: 'Accounts', email: 'accounts@jws.edu.np', role: 'Accountant',
+      dept_id: 5, dept_name: 'Accounts', reports: ['ot_summary'], active: true },
+  ];
+
   const syncLog = [
     { ts: `${today} 08:05`, job: 'Download logs', device: 'Main Gate', result: '312 records · 44 new', ok: 1 },
     { ts: `${today} 07:00`, job: 'Upload users', device: 'Main Gate', result: '44 users queued', ok: 1 },
@@ -258,6 +310,192 @@ export function createDemo() {
   };
 
   const wait = (v) => new Promise((r) => setTimeout(() => r(v), 30));
+
+  /**
+   * Build one report from the demo attendance rows.
+   *
+   * The column shapes mirror the Rust builders exactly, so the grid, its
+   * sorting, its totals row and the export dialog can all be exercised in a
+   * plain browser without the Rust half.
+   */
+  function demoReport(key, filters) {
+    const f = filters || {};
+    if (f.to < f.from) {
+      throw new Error(`The end date (${f.to}) is before the start date (${f.from}).`);
+    }
+    const label = (REPORT_KINDS.find(([k]) => k === key) || [])[1];
+    if (!label) throw new Error(`'${key}' is not a report this version knows how to produce.`);
+
+    const src = rowsFor(f.from, f.to, f.dept_id, f.member_id);
+    const col = (k, l, kind) => ({ key: k, label: l, kind });
+    const sum = (rows, keys) => Object.fromEntries(
+      keys.map((k) => [k, rows.reduce((t, r) => t + (Number(r[k]) || 0), 0)]));
+
+    const byMember = new Map();
+    for (const r of src) {
+      if (!byMember.has(r.member_id)) byMember.set(r.member_id, []);
+      byMember.get(r.member_id).push(r);
+    }
+
+    let columns = [];
+    let rows = [];
+    let totalKeys = [];
+
+    if (key === 'general' || key === 'duty_timetable' || key === 'daily_ot') {
+      rows = src
+        .filter((r) => key !== 'daily_ot' || (r.ot_min || 0) > 0)
+        .map((r) => ({
+          ac_no: r.enroll_no, name: r.full_name, dept: r.dept_name || 'Unassigned',
+          work_date: r.work_date, timetable: 'Regular Duty',
+          shift_name: 'Regular Teaching', on_duty: '09:00', off_duty: '16:00',
+          late_grace: 10, early_grace: 10,
+          clock_in: r.in_time, clock_out: r.out_time, status: r.status,
+          symbol: demoRules.sym_normal,
+          worked_min: r.worked_min, late_min: r.late_min, early_min: r.early_min,
+          ot_min: r.ot_min, weekend_ot_min: 0, total_ot_min: r.ot_min,
+          standard_min: r.worked_min,
+          exception: r.in_time && r.out_time ? '' : 'No check-out',
+          manual: r.manual ? 'Corrected' : '', remark: r.remark || '',
+        }));
+      columns = key === 'general' ? [
+        col('ac_no', 'AC No.', 'num'), col('name', 'Name', 'text'),
+        col('dept', 'Department', 'text'), col('work_date', 'Date', 'date'),
+        col('timetable', 'Timetable', 'text'),
+        col('clock_in', 'Clock In', 'time'), col('clock_out', 'Clock Out', 'time'),
+        col('status', 'Status', 'status'), col('symbol', 'Sym', 'text'),
+        col('worked_min', 'Worked', 'mins'), col('late_min', 'Late', 'mins'),
+        col('early_min', 'Early', 'mins'), col('ot_min', 'OT', 'mins'),
+        col('exception', 'Exception', 'text'), col('manual', 'Edited', 'text'),
+        col('remark', 'Remark', 'text'),
+      ] : key === 'duty_timetable' ? [
+        col('ac_no', 'AC No.', 'num'), col('name', 'Name', 'text'),
+        col('dept', 'Department', 'text'), col('work_date', 'Date', 'date'),
+        col('shift_name', 'Assigned Shift', 'text'), col('timetable', 'Timetable', 'text'),
+        col('on_duty', 'Expected On', 'text'), col('off_duty', 'Expected Off', 'text'),
+        col('late_grace', 'Late Grace', 'num'), col('early_grace', 'Early Grace', 'num'),
+        col('clock_in', 'Actual In', 'time'), col('clock_out', 'Actual Out', 'time'),
+        col('status', 'Status', 'status'),
+      ] : [
+        col('ac_no', 'AC No.', 'num'), col('name', 'Name', 'text'),
+        col('dept', 'Department', 'text'), col('work_date', 'Date', 'date'),
+        col('clock_in', 'In', 'time'), col('clock_out', 'Out', 'time'),
+        col('off_duty', 'Due Off', 'text'),
+        col('standard_min', 'Standard Hours', 'mins'), col('ot_min', 'OT Hours', 'mins'),
+        col('weekend_ot_min', 'Weekend OT', 'mins'), col('total_ot_min', 'Total OT', 'mins'),
+      ];
+      totalKeys = key === 'duty_timetable' ? []
+        : key === 'daily_ot' ? ['standard_min', 'ot_min', 'weekend_ot_min', 'total_ot_min']
+        : ['worked_min', 'late_min', 'early_min', 'ot_min'];
+    } else if (key === 'daily_stat' || key === 'ot_summary') {
+      rows = [...byMember.values()].map((rs) => {
+        const n = (p) => rs.filter(p).length;
+        const t = (k) => rs.reduce((a, r) => a + (Number(r[k]) || 0), 0);
+        const working = n((r) => !['Holiday', 'WeeklyOff'].includes(r.status));
+        const present = n((r) => ['Present', 'Late', 'EarlyLeave'].includes(r.status));
+        const half = n((r) => r.status === 'HalfDay');
+        return {
+          ac_no: rs[0].enroll_no, name: rs[0].full_name,
+          dept: rs[0].dept_name || 'Unassigned', designation: rs[0].designation || '',
+          present, late: n((r) => r.status === 'Late'),
+          early: n((r) => r.status === 'EarlyLeave'), half_day: half,
+          absent: n((r) => r.status === 'Absent'), leave_days: n((r) => r.status === 'Leave'),
+          exceptions: n((r) => r.status === 'MissingPunch'),
+          late_min: t('late_min'), early_min: t('early_min'),
+          worked_min: t('worked_min'), ot_min: t('ot_min'),
+          regular_ot_min: t('ot_min'), weekend_ot_min: 0, total_ot_min: t('ot_min'),
+          ot_days: n((r) => (r.ot_min || 0) > 0),
+          workdays: present + half * 0.5, working_days: working,
+          // A period with no working days in it must report zero, not NaN.
+          rate: working ? Math.round(((present + half * 0.5) / working) * 1000) / 10 : 0,
+        };
+      });
+      if (key === 'ot_summary') rows = rows.filter((r) => r.total_ot_min > 0);
+      columns = key === 'daily_stat' ? [
+        col('ac_no', 'AC No.', 'num'), col('name', 'Name', 'text'),
+        col('dept', 'Department', 'text'), col('present', 'Present', 'num'),
+        col('late', 'Late', 'num'), col('early', 'Early', 'num'),
+        col('half_day', 'Half Day', 'num'), col('absent', 'Absent', 'num'),
+        col('leave_days', 'Leave', 'num'), col('exceptions', 'Exceptions', 'num'),
+        col('late_min', 'Late Time', 'mins'), col('early_min', 'Early Time', 'mins'),
+        col('worked_min', 'Worked', 'mins'), col('ot_min', 'OT', 'mins'),
+        col('workdays', 'Workdays', 'num'), col('rate', 'Attendance %', 'pct'),
+      ] : [
+        col('ac_no', 'AC No.', 'num'), col('name', 'Name', 'text'),
+        col('dept', 'Department', 'text'), col('designation', 'Designation', 'text'),
+        col('ot_days', 'Days with OT', 'num'),
+        col('regular_ot_min', 'Regular OT', 'mins'),
+        col('weekend_ot_min', 'Weekend OT', 'mins'),
+        col('total_ot_min', 'Total OT', 'mins'),
+      ];
+      totalKeys = key === 'daily_stat'
+        ? ['present', 'late', 'early', 'half_day', 'absent', 'leave_days', 'exceptions',
+           'late_min', 'early_min', 'worked_min', 'ot_min', 'workdays']
+        : ['ot_days', 'regular_ot_min', 'weekend_ot_min', 'total_ot_min'];
+    } else {
+      // dept_stat, daily_shifts and daily_overtime all group by day.
+      const byDay = new Map();
+      for (const r of src) {
+        const k = key === 'dept_stat' ? `${r.dept_name}|${r.work_date}` : r.work_date;
+        if (!byDay.has(k)) byDay.set(k, []);
+        byDay.get(k).push(r);
+      }
+      rows = [...byDay.values()].map((rs) => {
+        const n = (p) => rs.filter(p).length;
+        const t = (k) => rs.reduce((a, r) => a + (Number(r[k]) || 0), 0);
+        const working = n((r) => !['Holiday', 'WeeklyOff'].includes(r.status));
+        const present = n((r) => ['Present', 'Late', 'EarlyLeave'].includes(r.status));
+        const half = n((r) => r.status === 'HalfDay');
+        return {
+          dept: rs[0].dept_name || 'Unassigned', work_date: rs[0].work_date,
+          shift_name: 'Regular Teaching', timetable: 'Regular Duty',
+          on_duty: '09:00', off_duty: '16:00',
+          total_staff: new Set(rs.map((r) => r.member_id)).size,
+          present, absent: n((r) => r.status === 'Absent'),
+          late: n((r) => r.status === 'Late'), half_day: half,
+          leave_days: n((r) => r.status === 'Leave'),
+          rostered: rs.length, attended: present + half,
+          late_min: t('late_min'), ot_min: t('ot_min'),
+          regular_ot_min: t('ot_min'), weekend_ot_min: 0, total_ot_min: t('ot_min'),
+          longest_min: rs.reduce((a, r) => Math.max(a, r.ot_min || 0), 0),
+          staff_on_ot: n((r) => (r.ot_min || 0) > 0),
+          rate: working ? Math.round(((present + half * 0.5) / working) * 1000) / 10 : 0,
+        };
+      });
+      if (key === 'daily_overtime') rows = rows.filter((r) => r.total_ot_min > 0);
+      columns = key === 'dept_stat' ? [
+        col('dept', 'Department', 'text'), col('work_date', 'Date', 'date'),
+        col('total_staff', 'Total Staff', 'num'), col('present', 'Present', 'num'),
+        col('absent', 'Absent', 'num'), col('late', 'Late', 'num'),
+        col('half_day', 'Half Day', 'num'), col('leave_days', 'Leave', 'num'),
+        col('ot_min', 'OT', 'mins'), col('rate', 'Attendance %', 'pct'),
+      ] : key === 'daily_shifts' ? [
+        col('work_date', 'Date', 'date'), col('shift_name', 'Shift', 'text'),
+        col('timetable', 'Timetable', 'text'), col('on_duty', 'On Duty', 'text'),
+        col('off_duty', 'Off Duty', 'text'), col('rostered', 'Rostered', 'num'),
+        col('attended', 'Attended', 'num'), col('absent', 'Absent', 'num'),
+        col('late_min', 'Late', 'mins'), col('ot_min', 'OT', 'mins'),
+      ] : [
+        col('work_date', 'Date', 'date'), col('staff_on_ot', 'Staff on OT', 'num'),
+        col('regular_ot_min', 'Regular OT', 'mins'),
+        col('weekend_ot_min', 'Weekend OT', 'mins'),
+        col('total_ot_min', 'Total OT', 'mins'), col('longest_min', 'Longest', 'mins'),
+      ];
+      totalKeys = key === 'dept_stat'
+        ? ['present', 'absent', 'late', 'half_day', 'leave_days', 'ot_min']
+        : key === 'daily_shifts'
+        ? ['rostered', 'attended', 'absent', 'late_min', 'ot_min']
+        : ['regular_ot_min', 'weekend_ot_min', 'total_ot_min'];
+    }
+
+    return {
+      key,
+      title: label,
+      subtitle: `${f.from} to ${f.to}`,
+      columns,
+      rows,
+      totals: sum(rows, totalKeys),
+    };
+  }
 
   const handlers = {
     app_info: () => ({
@@ -451,8 +689,85 @@ export function createDemo() {
       if (row) Object.assign(row, { status, in_time: inTime, out_time: outTime, remark, manual: true });
     },
 
-    list_shifts: () => shifts,
-    list_timetables: () => timetables,
+    // --- the three-tier roster, as the desktop build now models it --------
+    // `shifts` in the demo data is the old flat list of duty blocks, which is
+    // exactly what a *timetable* now means; the weekly plans are the shifts.
+    list_timetables_full: () =>
+      shifts.map((s, i) => ({
+        id: s.id, name: s.name, on_duty: s.start_time, off_duty: s.end_time,
+        in_begin: '06:00', in_end: '12:30', out_begin: '12:30', out_end: '21:00',
+        late_grace: s.late_grace ?? 10, early_grace: s.early_grace ?? 10,
+        break_min: s.break_min ?? 0, workday_value: 1, work_minutes: 0,
+        must_c_in: true, must_c_out: true, count_ot: true, min_ot_block: 30,
+        colour: ['#F16522', '#2563EB', '#16A34A', '#9333EA', '#DC2626', '#0891B2'][i % 6],
+        active: true, used_by: 1,
+      })),
+    save_timetable: ({ tt }) => tt.id || shifts.length + 1,
+    delete_timetable: () => null,
+
+    list_shift_cycles: () =>
+      timetables.map((t) => ({
+        id: t.id, name: t.name, code: '', begin_date: todayIso(),
+        cycle_num: 1, cycle_unit: 'Week', active: true, assigned: t.assigned ?? 0,
+      })),
+    save_shift: ({ shift }) => shift.id || timetables.length + 1,
+    delete_shift: () => null,
+    shift_grid: ({ shiftId }) => {
+      const t = timetables.find((x) => x.id === shiftId);
+      if (!t) return [];
+      // "REG,REG,REG,REG,REG,REG,-" — a dash is a rest day.
+      return String(t.days || '').split(',').flatMap((code, day) => {
+        if (!code || code === '-') return [];
+        const block = shifts.find((s) => s.code === code) || shifts[0];
+        return [{
+          id: shiftId * 100 + day, day_index: day, timetable_id: block.id,
+          timetable_name: block.name, on_duty: block.start_time,
+          off_duty: block.end_time, colour: '#F16522',
+        }];
+      });
+    },
+    add_shift_item: () => 1,
+    delete_shift_item: () => null,
+    clear_shift_grid: () => 0,
+
+    department_tree: () => DEPTS.map((d) => ({
+      id: d.id, name: d.name, code: d.code, colour: d.colour,
+      member_count: members.filter((m) => m.dept_id === d.id).length,
+    })),
+    roster: ({ deptId }) =>
+      members.filter((m) => !deptId || m.dept_id === deptId).map((m) => ({
+        id: m.id, member_id: m.id, member_name: m.full_name, enroll_no: m.enroll_no,
+        shift_id: 1, shift_name: timetables[0]?.name || 'Regular',
+        start_date: '2025-01-01', end_date: null, is_temporary: false, note: null,
+      })),
+    save_schedule: ({ row }) => row.id || 1,
+    delete_schedule: () => null,
+    arrange_shifts: ({ memberIds }) => memberIds.length,
+    member_calendar: ({ memberId, from, to }) => {
+      const out = [];
+      let d = from;
+      // Bounded so a mistyped range cannot spin the browser.
+      for (let i = 0; i < 120 && d <= to; i++) {
+        const wd = new Date(`${d}T00:00:00`).getDay();
+        const off = wd === 6;
+        out.push({
+          date: d, date_bs: null, weekday: wd, is_weekend: off, holiday: null,
+          plan: {
+            shift_id: 1,
+            timetables: off ? [] : [{
+              id: 1, name: 'Regular Duty', on_min: 540, off_min: 960,
+              in_begin: 360, in_end: 750, out_begin: 750, out_end: 1260,
+              late_grace: 10, early_grace: 10, break_min: 40, workday_value: 1,
+              work_minutes: 0, must_c_in: true, must_c_out: true,
+              count_ot: true, min_ot_block: 30, colour: '#F16522',
+            }],
+          },
+        });
+        d = addDaysIso(d, 1);
+      }
+      return out;
+    },
+
     list_holidays: () => holidays,
     save_holiday: ({ holiday }) => {
       if (holiday.to_date < holiday.from_date) throw new Error('The end date is before the start date.');
@@ -467,10 +782,41 @@ export function createDemo() {
     delete_holiday: ({ id }) => {
       holidays.splice(holidays.findIndex((h) => h.id === id), 1);
     },
-    set_member_timetable: ({ memberId, timetableId }) => {
-      const m = members.find((x) => x.id === memberId);
-      if (m) m.timetable_id = timetableId;
+    bs_calendar: () => BS_TABLE,
+
+    get_attendance_rules: () => ({ ...demoRules }),
+    save_attendance_rules: ({ rules: r }) => {
+      // Mirror the backend's own refusal, so the screen can be exercised.
+      if (r.half_day_after_min >= r.late_to_absent_min && r.late_to_absent_enabled) {
+        throw new Error('Half day must come before absent, or nobody is ever a half day.');
+      }
+      if (r.weekend_days.every(Boolean)) throw new Error('Every day cannot be a weekend.');
+      Object.assign(demoRules, r);
     },
+
+    report_kinds: () => REPORT_KINDS.map(([key, label]) => ({ key, label })),
+    run_report: ({ key, filters }) => demoReport(key, filters),
+    export_report: ({ path }) => path,
+    list_recipients: () => recipients,
+    save_recipient: ({ r }) => {
+      if (!String(r.email).includes('@')) throw new Error(`'${r.email}' is missing an @.`);
+      if (r.id) {
+        Object.assign(recipients.find((x) => x.id === r.id), r);
+        return r.id;
+      }
+      const id = recipients.length + 1;
+      recipients.push({ ...r, id, dept_name: null });
+      return id;
+    },
+    delete_recipient: ({ id }) => {
+      const i = recipients.findIndex((x) => x.id === id);
+      if (i >= 0) recipients.splice(i, 1);
+    },
+    send_report_email: ({ recipientIds }) => ({
+      sent: recipientIds.length, failed: 0,
+      details: recipientIds.map((i) => `Sent to recipient ${i}`),
+    }),
+    report_mail_log: () => [],
 
     get_rules: () => ({ ...rules }),
     set_rules: ({ rules: r }) => {
@@ -489,7 +835,7 @@ export function createDemo() {
         punches, devices, shifts, timetables, holidays, audit_log: auditLog,
         sync_log: syncLog, rules: Object.entries(rules).map(([key, value]) => ({ key, value })),
         settings: Object.entries(settings).map(([key, value]) => ({ key, value })),
-        leaves: [], timetable_days: [], device_commands: [],
+        leaves: [], shift_items: [], employee_schedules: [], device_commands: [],
       }[table];
       if (!source) throw new Error(`'${table}' is not a table you can browse.`);
       return { total: source.length, rows: source.slice(0, limit) };

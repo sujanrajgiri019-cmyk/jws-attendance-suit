@@ -148,6 +148,51 @@ fn row(year: i32) -> Option<&'static [u8; 12]> {
     BS_MONTHS.get((year - BS_START_YEAR) as usize)
 }
 
+/// Everything the interface needs to render a Bikram Sambat date picker.
+///
+/// Handing the whole table over once, at start-up, keeps a single source of
+/// truth: the picker on screen and the conversions on reports are driven by the
+/// same numbers, so a corrected month length can never disagree between them.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BsTable {
+    pub min_year: i32,
+    pub max_year: i32,
+    /// `months[year - min_year][month - 1]` is that month's length.
+    pub months: Vec<Vec<u8>>,
+    pub month_names: Vec<String>,
+    /// Nepali digits, so a date can be printed the way it is read locally.
+    pub digits: Vec<String>,
+    pub day_names: Vec<String>,
+    pub day_names_short: Vec<String>,
+    /// The AD date of 1 Baisakh of `min_year`, as `YYYY-MM-DD`.
+    pub anchor_ad: String,
+}
+
+pub fn bs_table() -> BsTable {
+    BsTable {
+        min_year: BS_START_YEAR,
+        max_year: BS_END_YEAR,
+        months: BS_MONTHS.iter().map(|r| r.to_vec()).collect(),
+        month_names: BS_MONTH_NAMES.iter().map(|s| s.to_string()).collect(),
+        digits: ["०", "१", "२", "३", "४", "५", "६", "७", "८", "९"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        day_names: [
+            "Aaitabar", "Sombar", "Mangalbar", "Budhabar",
+            "Bihibar", "Sukrabar", "Sanibar",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+        day_names_short: ["Aai", "Som", "Man", "Bud", "Bihi", "Suk", "Sani"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        anchor_ad: format!("{:04}-{:02}-{:02}", ANCHOR_AD.0, ANCHOR_AD.1, ANCHOR_AD.2),
+    }
+}
+
 /// Days in a given BS month, or `None` if outside the known table.
 pub fn days_in_bs_month(year: i32, month: u32) -> Option<u32> {
     if !(1..=12).contains(&month) {
@@ -273,6 +318,63 @@ pub fn bs_month_of(iso: &str) -> Option<(i32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_exported_table_matches_the_conversion_functions() {
+        // The picker on screen is driven by this table while reports are driven
+        // by the functions. If they ever disagree, a date chosen in the picker
+        // lands on a different day in the report — so pin them together.
+        let t = bs_table();
+        assert_eq!(t.min_year, BS_START_YEAR);
+        assert_eq!(t.max_year, BS_END_YEAR);
+        assert_eq!(t.months.len(), (BS_END_YEAR - BS_START_YEAR + 1) as usize);
+        assert_eq!(t.month_names.len(), 12);
+        assert_eq!(t.digits.len(), 10);
+        assert_eq!(t.day_names.len(), 7);
+
+        for (i, row) in t.months.iter().enumerate() {
+            let year = BS_START_YEAR + i as i32;
+            assert_eq!(row.len(), 12, "year {year} does not have twelve months");
+            for (m, len) in row.iter().enumerate() {
+                assert_eq!(
+                    days_in_bs_month(year, m as u32 + 1),
+                    Some(*len as u32),
+                    "table and function disagree on {year}-{}",
+                    m + 1
+                );
+                // No Nepali month is shorter than 29 or longer than 32 days.
+                assert!((29..=32).contains(len), "{year}-{} has {len} days", m + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn the_anchor_the_table_publishes_really_is_the_first_of_baisakh() {
+        let t = bs_table();
+        let bs = iso_to_bs(&t.anchor_ad).unwrap();
+        assert_eq!((bs.year, bs.month, bs.day), (BS_START_YEAR, 1, 1));
+    }
+
+    #[test]
+    fn every_year_in_the_table_round_trips_through_its_first_and_last_day() {
+        // A picker lets someone jump to any year in the range. Each of those
+        // years has to convert both ways, or the picker offers a date the rest
+        // of the app cannot use.
+        for year in BS_START_YEAR..=BS_END_YEAR {
+            let last_month_len = days_in_bs_month(year, 12).unwrap();
+            for (m, d) in [(1u32, 1u32), (12, last_month_len)] {
+                let ad = bs_to_ad(year, m, d)
+                    .unwrap_or_else(|| panic!("{year}-{m}-{d} did not convert to AD"));
+                let back = ad_to_bs(ad.0, ad.1, ad.2)
+                    .unwrap_or_else(|| panic!("{ad:?} did not convert back"));
+                assert_eq!(
+                    (back.year, back.month, back.day),
+                    (year, m, d),
+                    "{year}-{m}-{d} did not survive the round trip"
+                );
+            }
+        }
+    }
 
     #[test]
     fn matches_live_reference_date() {

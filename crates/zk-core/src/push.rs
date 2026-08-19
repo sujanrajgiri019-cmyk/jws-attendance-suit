@@ -65,6 +65,76 @@ pub fn handshake_response(serial: &str, stamp: u64, cfg: &PushConfig) -> String 
     )
 }
 
+/// One user record as the terminal reports it over ADMS.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PushUser {
+    pub pin: String,
+    pub name: String,
+    pub privilege: u8,
+    pub password: String,
+    pub card: String,
+    pub group: u8,
+}
+
+/// Parse a `table=OPERLOG`-style USERINFO body.
+///
+/// Each line looks like:
+///
+/// ```text
+/// USER PIN=41\tName=Sarita Maharjan\tPri=0\tPasswd=\tCard=0\tGrp=1\tTZ=0000000000000000
+/// ```
+///
+/// Fields are `key=value` pairs in no guaranteed order, and firmware versions
+/// differ in which ones they include — so this reads them by name rather than
+/// by position, and skips a line only when it has no PIN to join on.
+pub fn parse_userinfo_body(body: &str) -> Vec<PushUser> {
+    let mut out = Vec::new();
+
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Drop the leading record type ("USER ", "OPLOG ", ...) if present.
+        let rest = line.strip_prefix("USER").unwrap_or(line).trim_start();
+        if rest.is_empty() {
+            continue;
+        }
+
+        let mut u = PushUser { privilege: 0, group: 1, ..Default::default() };
+        let mut saw_pin = false;
+
+        for field in rest.split('\t') {
+            let Some((k, v)) = field.split_once('=') else { continue };
+            let v = v.trim();
+            match k.trim() {
+                "PIN" | "PIN2" => {
+                    // Some firmware sends both PIN (index) and PIN2 (the number
+                    // typed on the keypad). PIN2 is the one everything joins on,
+                    // so it wins when both are present.
+                    if k.trim() == "PIN2" || !saw_pin {
+                        u.pin = v.to_string();
+                        saw_pin = true;
+                    }
+                }
+                "Name" => u.name = v.to_string(),
+                "Pri" => u.privilege = v.parse().unwrap_or(0),
+                "Passwd" => u.password = v.to_string(),
+                "Card" => u.card = v.to_string(),
+                "Grp" => u.group = v.parse().unwrap_or(1),
+                _ => {}
+            }
+        }
+
+        // A record with no enrolment number cannot be joined to anything.
+        if u.pin.trim().is_empty() || u.pin.trim().parse::<i64>().is_err() {
+            continue;
+        }
+        out.push(u);
+    }
+    out
+}
+
 /// Parse the tab-separated ATTLOG body a device posts to `/iclock/cdata`.
 ///
 /// Layout is `user_id \t timestamp \t status \t verify \t workcode ...`, one
@@ -203,6 +273,16 @@ pub enum DeviceCommand {
     Reboot,
     /// Clear the stored attendance log.
     ClearLog,
+    /// Ask the device to re-send its attendance log for a date range.
+    ///
+    /// This is the push-mode equivalent of dialling the terminal on port 4370
+    /// and pulling the records: instead of this PC opening a connection to the
+    /// device, the device is told what to send the next time it checks in. On a
+    /// terminal configured for ADMS that is usually the *only* way in, because
+    /// enabling the cloud server commonly closes the direct TCP port.
+    QueryAttlog { from: String, to: String },
+    /// Ask the device to re-send its user table.
+    QueryUserInfo,
 }
 
 impl DeviceCommand {
@@ -218,6 +298,13 @@ impl DeviceCommand {
             DeviceCommand::CheckData => format!("C:{id}:CHECK"),
             DeviceCommand::Reboot => format!("C:{id}:REBOOT"),
             DeviceCommand::ClearLog => format!("C:{id}:CLEAR LOG"),
+            // Dates go as 'YYYY-MM-DD HH:MM:SS'; the terminal ignores a range
+            // it cannot satisfy and sends what it has.
+            DeviceCommand::QueryAttlog { from, to } => format!(
+                "C:{id}:DATA QUERY ATTLOG StartTime={from} 00:00:00\tEndTime={to} 23:59:59"
+            ),
+            // An empty PIN means every user.
+            DeviceCommand::QueryUserInfo => format!("C:{id}:DATA QUERY USERINFO PIN="),
         }
     }
 }
@@ -225,6 +312,100 @@ impl DeviceCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_query_names_the_range_the_device_expects() {
+        let c = DeviceCommand::QueryAttlog {
+            from: "2026-08-01".into(),
+            to: "2026-08-19".into(),
+        };
+        let line = c.encode(7);
+        assert_eq!(
+            line,
+            "C:7:DATA QUERY ATTLOG StartTime=2026-08-01 00:00:00\tEndTime=2026-08-19 23:59:59"
+        );
+        // The id has to match the row the device reports back against, or the
+        // command is never marked as done and is handed out again forever.
+        assert!(line.starts_with("C:7:"));
+    }
+
+    #[test]
+    fn a_user_query_asks_for_everyone() {
+        assert_eq!(DeviceCommand::QueryUserInfo.encode(3), "C:3:DATA QUERY USERINFO PIN=");
+    }
+
+    #[test]
+    fn every_command_is_one_line_with_its_id_first() {
+        // The device reads one command per line. A newline inside any of these
+        // would split it into two commands, the second of them nonsense.
+        let all = [
+            DeviceCommand::CheckData,
+            DeviceCommand::Reboot,
+            DeviceCommand::ClearLog,
+            DeviceCommand::QueryUserInfo,
+            DeviceCommand::QueryAttlog { from: "2026-01-01".into(), to: "2026-01-31".into() },
+            DeviceCommand::DeleteUser { pin: "41".into() },
+        ];
+        for c in all {
+            let line = c.encode(11);
+            assert!(!line.contains('\n'), "command spans two lines: {line}");
+            assert!(line.starts_with("C:11:"), "id must lead: {line}");
+        }
+    }
+
+
+    #[test]
+    fn parses_a_userinfo_post() {
+        let body = "USER PIN=41\tName=Sarita Maharjan\tPri=0\tPasswd=\tCard=0\tGrp=1\tTZ=0\n\
+                    USER PIN=12\tName=Ramesh Karki\tPri=14\tPasswd=1234\tCard=99\tGrp=2\n";
+        let users = parse_userinfo_body(body);
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0].pin, "41");
+        assert_eq!(users[0].name, "Sarita Maharjan");
+        assert_eq!(users[0].privilege, 0);
+        assert_eq!(users[1].privilege, 14, "the super admin flag must survive");
+        assert_eq!(users[1].card, "99");
+        assert_eq!(users[1].group, 2);
+    }
+
+    #[test]
+    fn userinfo_fields_are_read_by_name_not_position() {
+        // Firmware differs in field order and in which fields it sends at all.
+        let body = "USER Name=Out Of Order\tGrp=1\tPIN=7\tCard=5";
+        let u = &parse_userinfo_body(body)[0];
+        assert_eq!(u.pin, "7");
+        assert_eq!(u.name, "Out Of Order");
+        assert_eq!(u.card, "5");
+        assert_eq!(u.password, "", "a missing field is empty, not a parse failure");
+    }
+
+    #[test]
+    fn pin2_wins_over_the_internal_index() {
+        // PIN is the device's own row number; PIN2 is what is typed on the
+        // keypad and what every punch is joined on. Reading the wrong one
+        // silently attaches a month of attendance to the wrong person.
+        let body = "USER PIN=3\tPIN2=118\tName=Nabin Rai";
+        assert_eq!(parse_userinfo_body(body)[0].pin, "118");
+    }
+
+    #[test]
+    fn userinfo_lines_without_a_usable_pin_are_skipped() {
+        let body = "USER Name=No Number\tCard=1\n\
+                    USER PIN=\tName=Blank\n\
+                    USER PIN=abc\tName=Not A Number\n\
+                    USER PIN=9\tName=Good\n\
+                    \n";
+        let users = parse_userinfo_body(body);
+        assert_eq!(users.len(), 1, "only the joinable record should survive");
+        assert_eq!(users[0].pin, "9");
+    }
+
+    #[test]
+    fn a_userinfo_body_that_is_rubbish_returns_nothing_rather_than_panicking() {
+        assert!(parse_userinfo_body("").is_empty());
+        assert!(parse_userinfo_body("\n\n\n").is_empty());
+        assert!(parse_userinfo_body("total nonsense with no equals signs").is_empty());
+    }
 
     #[test]
     fn parses_a_normal_attlog_post() {

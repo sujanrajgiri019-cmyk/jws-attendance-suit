@@ -123,8 +123,76 @@ fn handle(
             return text("OK\r\n".into());
         }
 
+        // The user table, usually arriving because the Data Transfer screen
+        // asked for it. Handled before ATTLOG so a requested download actually
+        // lands instead of being acknowledged and thrown away.
+        if table.eq_ignore_ascii_case("USERINFO") || table.eq_ignore_ascii_case("OPERLOG") {
+            let users = push::parse_userinfo_body(&body);
+            let mut added = 0usize;
+            let mut updated = 0usize;
+            if !users.is_empty() {
+                if let Ok(conn) = db.lock() {
+                    for u in &users {
+                        let Ok(enroll) = u.pin.trim().parse::<i64>() else { continue };
+                        let name = if u.name.trim().is_empty() {
+                            format!("Unnamed {enroll}")
+                        } else {
+                            u.name.trim().to_string()
+                        };
+                        let exists: bool = conn
+                            .query_row(
+                                "SELECT 1 FROM members WHERE enroll_no=?1",
+                                params![enroll],
+                                |_| Ok(true),
+                            )
+                            .unwrap_or(false);
+
+                        if exists {
+                            // Never overwrite a name the office has corrected
+                            // here; the terminal's 24-character version is the
+                            // worse of the two. Only fill in what is missing.
+                            let n = conn
+                                .execute(
+                                    "UPDATE members
+                                       SET card_no = COALESCE(NULLIF(card_no,''), ?2),
+                                           privilege = ?3,
+                                           device_name = COALESCE(NULLIF(device_name,''), ?4),
+                                           updated_at = datetime('now','localtime')
+                                     WHERE enroll_no = ?1",
+                                    params![enroll, u.card, u.privilege as i64, name],
+                                )
+                                .unwrap_or(0);
+                            updated += n;
+                        } else if conn
+                            .execute(
+                                "INSERT INTO members
+                                   (enroll_no, full_name, device_name, card_no, privilege, status)
+                                 VALUES (?1, ?2, ?2, ?3, ?4, 'Active')",
+                                params![enroll, name, u.card, u.privilege as i64],
+                            )
+                            .is_ok()
+                        {
+                            added += 1;
+                        }
+                    }
+                    tracing::info!(
+                        "terminal {serial}: {added} users added, {updated} updated"
+                    );
+                    let _ = zk_core::db::log_sync(
+                        &conn,
+                        "Receive users",
+                        &serial,
+                        &format!("{added} added, {updated} updated"),
+                        true,
+                    );
+                    let _ = app.emit("users-received", added as i64);
+                }
+            }
+            return text(format!("OK: {}\r\n", users.len()));
+        }
+
         if !table.eq_ignore_ascii_case("ATTLOG") {
-            // OPERLOG and friends are acknowledged so the device moves on.
+            // Anything else is acknowledged so the device moves on.
             return text("OK\r\n".into());
         }
 
@@ -153,6 +221,43 @@ fn handle(
 
                     for l in &logs {
                         let enroll: i64 = l.user_id.trim().parse().unwrap_or(0);
+
+                        // Someone scanned whose enrolment number we have never
+                        // seen. Create a placeholder rather than dropping the
+                        // punch on the floor: the office can put a name to it
+                        // later, and the attendance history is preserved from
+                        // the first scan because everything joins on the
+                        // enrolment number, not the name.
+                        if enroll > 0 {
+                            let known: bool = conn
+                                .query_row(
+                                    "SELECT 1 FROM members WHERE enroll_no=?1",
+                                    params![enroll],
+                                    |_| Ok(true),
+                                )
+                                .unwrap_or(false);
+                            if !known {
+                                let placeholder = format!("Unnamed {enroll}");
+                                if conn
+                                    .execute(
+                                        "INSERT OR IGNORE INTO members
+                                           (enroll_no, full_name, device_name, status)
+                                         VALUES (?1, ?2, ?2, 'Active')",
+                                        params![enroll, placeholder],
+                                    )
+                                    .is_ok()
+                                {
+                                    tracing::info!("created placeholder member for enrolment {enroll}");
+                                    let _ = zk_core::db::audit(
+                                        &conn,
+                                        "system",
+                                        "member.auto_created",
+                                        &format!("enrolment {enroll} seen on {serial}"),
+                                    );
+                                }
+                            }
+                        }
+
                         let name: Option<String> = conn
                             .query_row(
                                 "SELECT full_name FROM members WHERE enroll_no=?1",

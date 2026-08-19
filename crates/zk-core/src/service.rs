@@ -7,7 +7,9 @@
 
 use crate::calendar;
 use crate::db;
-use crate::rules::{self, DayKind, DayResult, Policy, Shift, Status, Summary};
+use crate::rules::{self, DayKind, DayResult, Status, Summary};
+use crate::ruleset::AttendanceRules;
+use crate::schedule::Roster;
 use crate::{Error, Result};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -37,7 +39,10 @@ pub struct Member {
     pub fp_count: i64,
     pub status: String,
     pub joined_on: Option<String>,
-    pub timetable_id: Option<i64>,
+    /// The shift governing this member today, resolved from their schedule.
+    pub shift_id: Option<i64>,
+    pub shift_name: Option<String>,
+    pub access_group: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -58,7 +63,14 @@ pub struct MemberInput {
     pub device_password: Option<String>,
     pub status: String,
     pub joined_on: Option<String>,
-    pub timetable_id: Option<i64>,
+    /// Setting this opens (or moves) the member's standing schedule row.
+    pub shift_id: Option<i64>,
+    #[serde(default = "default_access_group")]
+    pub access_group: i64,
+}
+
+fn default_access_group() -> i64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,8 +81,8 @@ pub struct Department {
     pub colour: String,
     pub head_member_id: Option<i64>,
     pub head_name: Option<String>,
-    pub default_timetable_id: Option<i64>,
-    pub timetable_name: Option<String>,
+    pub default_shift_id: Option<i64>,
+    pub shift_name: Option<String>,
     pub member_count: i64,
 }
 
@@ -107,6 +119,10 @@ pub struct AttendanceRow {
     pub late_min: i64,
     pub early_min: i64,
     pub ot_min: i64,
+    pub weekend_ot_min: i64,
+    pub workday_value: f64,
+    /// 'MissingIn' | 'MissingOut' | 'Both' | 'ImplausibleSpan', or none.
+    pub exception: Option<String>,
     pub status: String,
     pub remark: Option<String>,
     pub manual: bool,
@@ -154,7 +170,9 @@ fn member_from_row(r: &Row) -> rusqlite::Result<Member> {
         fp_count: r.get("fp_count")?,
         status: r.get("status")?,
         joined_on: r.get("joined_on")?,
-        timetable_id: r.get("timetable_id")?,
+        shift_id: r.get("shift_id")?,
+        shift_name: r.get("shift_name")?,
+        access_group: r.get("access_group")?,
     })
 }
 
@@ -162,8 +180,22 @@ const MEMBER_SELECT: &str = "
     SELECT m.id, m.enroll_no, m.staff_id, m.full_name, m.device_name, m.dept_id,
            d.name AS dept_name, d.code AS dept_code, d.colour AS dept_colour,
            m.designation, m.gender, m.dob, m.mobile, m.email, m.card_no,
-           m.privilege, m.fp_count, m.status, m.joined_on, m.timetable_id
-    FROM members m LEFT JOIN departments d ON d.id = m.dept_id";
+           m.privilege, m.fp_count, m.status, m.joined_on, m.access_group,
+           COALESCE(es.shift_id, d.default_shift_id) AS shift_id,
+           COALESCE(sh.name, dsh.name)              AS shift_name
+    FROM members m
+    LEFT JOIN departments d ON d.id = m.dept_id
+    -- The member's own standing assignment as it stands today. Temporary rows
+    -- are deliberately excluded: this column is 'what shift is this person on',
+    -- not 'what are they doing this particular week'.
+    LEFT JOIN employee_schedules es ON es.id = (
+        SELECT id FROM employee_schedules
+        WHERE member_id = m.id AND is_temporary = 0
+          AND start_date <= date('now','localtime')
+          AND (end_date IS NULL OR end_date >= date('now','localtime'))
+        ORDER BY start_date DESC, id DESC LIMIT 1)
+    LEFT JOIN shifts sh  ON sh.id  = es.shift_id
+    LEFT JOIN shifts dsh ON dsh.id = d.default_shift_id";
 
 pub fn list_members(
     conn: &Connection,
@@ -257,14 +289,15 @@ pub fn save_member(conn: &Connection, m: &MemberInput) -> Result<i64> {
                 "UPDATE members SET enroll_no=?1, staff_id=?2, full_name=?3, device_name=?4,
                     dept_id=?5, designation=?6, gender=?7, dob=?8, mobile=?9, email=?10,
                     card_no=?11, privilege=?12, device_password=?13, status=?14, joined_on=?15,
-                    timetable_id=?16, updated_at=datetime('now','localtime')
+                    access_group=?16, updated_at=datetime('now','localtime')
                  WHERE id=?17",
                 params![
                     m.enroll_no, m.staff_id, m.full_name, device_name, m.dept_id, m.designation,
                     m.gender, m.dob, m.mobile, m.email, m.card_no, m.privilege, m.device_password,
-                    m.status, m.joined_on, m.timetable_id, id
+                    m.status, m.joined_on, m.access_group, id
                 ],
             )?;
+            set_standing_shift(conn, id, m.shift_id, m.joined_on.as_deref())?;
             db::audit(conn, "admin", "member.update", &format!("{} ({})", m.full_name, m.enroll_no))?;
             Ok(id)
         }
@@ -272,19 +305,98 @@ pub fn save_member(conn: &Connection, m: &MemberInput) -> Result<i64> {
             conn.execute(
                 "INSERT INTO members (enroll_no, staff_id, full_name, device_name, dept_id,
                     designation, gender, dob, mobile, email, card_no, privilege, device_password,
-                    status, joined_on, timetable_id)
+                    status, joined_on, access_group)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 params![
                     m.enroll_no, m.staff_id, m.full_name, device_name, m.dept_id, m.designation,
                     m.gender, m.dob, m.mobile, m.email, m.card_no, m.privilege, m.device_password,
-                    m.status, m.joined_on, m.timetable_id
+                    m.status, m.joined_on, m.access_group
                 ],
             )?;
             let id = conn.last_insert_rowid();
+            set_standing_shift(conn, id, m.shift_id, m.joined_on.as_deref())?;
             db::audit(conn, "admin", "member.create", &format!("{} ({})", m.full_name, m.enroll_no))?;
             Ok(id)
         }
     }
+}
+
+/// Point a member at a shift, without disturbing their history.
+///
+/// Changing someone's shift is not an edit to a field — it is a new chapter.
+/// The previous standing row is closed off yesterday and a new one opened
+/// today, so recomputing last month still resolves the shift they were
+/// actually on at the time. Temporary rows are left alone: an exam-week
+/// arrangement is not cancelled by a change of contract.
+pub fn set_standing_shift(
+    conn: &Connection,
+    member_id: i64,
+    shift_id: Option<i64>,
+    joined_on: Option<&str>,
+) -> Result<()> {
+    let current: Option<(i64, i64, String)> = conn
+        .query_row(
+            "SELECT id, shift_id, start_date FROM employee_schedules
+             WHERE member_id = ?1 AND is_temporary = 0
+               AND (end_date IS NULL OR end_date >= date('now','localtime'))
+             ORDER BY start_date DESC, id DESC LIMIT 1",
+            params![member_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+
+    match (shift_id, current) {
+        // Nothing chosen and nothing on file: nothing to do.
+        (None, None) => {}
+
+        // Cleared: close the open row rather than deleting it.
+        (None, Some((id, _, _))) => {
+            conn.execute(
+                "UPDATE employee_schedules SET end_date = date('now','localtime','-1 day')
+                 WHERE id = ?1",
+                params![id],
+            )?;
+        }
+
+        // Unchanged.
+        (Some(want), Some((_, have, _))) if want == have => {}
+
+        // Changed: close the old chapter, open the new one.
+        (Some(want), Some((id, _, start))) => {
+            let today: String =
+                conn.query_row("SELECT date('now','localtime')", [], |r| r.get(0))?;
+            if start >= today {
+                // The old row had not taken effect yet, so correct it in place
+                // instead of leaving a zero-length chapter behind.
+                conn.execute(
+                    "UPDATE employee_schedules SET shift_id = ?1 WHERE id = ?2",
+                    params![want, id],
+                )?;
+            } else {
+                conn.execute(
+                    "UPDATE employee_schedules SET end_date = date('now','localtime','-1 day')
+                     WHERE id = ?1",
+                    params![id],
+                )?;
+                conn.execute(
+                    "INSERT INTO employee_schedules (member_id, shift_id, start_date)
+                     VALUES (?1, ?2, date('now','localtime'))",
+                    params![member_id, want],
+                )?;
+            }
+        }
+
+        // First assignment. Backdate to the joining date so a recompute over
+        // the months before today still finds a shift to measure against.
+        (Some(want), None) => {
+            conn.execute(
+                "INSERT INTO employee_schedules (member_id, shift_id, start_date)
+                 VALUES (?1, ?2, COALESCE(?3, date('now','localtime')))",
+                params![member_id, want, joined_on],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub fn delete_members(conn: &Connection, ids: &[i64]) -> Result<usize> {
@@ -317,11 +429,11 @@ pub fn set_members_department(conn: &Connection, ids: &[i64], dept_id: i64) -> R
 pub fn list_departments(conn: &Connection) -> Result<Vec<Department>> {
     let mut stmt = conn.prepare(
         "SELECT d.id, d.name, d.code, d.colour, d.head_member_id, h.full_name AS head_name,
-                d.default_timetable_id, t.name AS timetable_name,
+                d.default_shift_id, t.name AS shift_name,
                 (SELECT count(*) FROM members m WHERE m.dept_id = d.id) AS member_count
          FROM departments d
          LEFT JOIN members h ON h.id = d.head_member_id
-         LEFT JOIN timetables t ON t.id = d.default_timetable_id
+         LEFT JOIN shifts t ON t.id = d.default_shift_id
          WHERE d.active = 1
          ORDER BY d.id",
     )?;
@@ -333,8 +445,8 @@ pub fn list_departments(conn: &Connection) -> Result<Vec<Department>> {
             colour: r.get("colour")?,
             head_member_id: r.get("head_member_id")?,
             head_name: r.get("head_name")?,
-            default_timetable_id: r.get("default_timetable_id")?,
-            timetable_name: r.get("timetable_name")?,
+            default_shift_id: r.get("default_shift_id")?,
+            shift_name: r.get("shift_name")?,
             member_count: r.get("member_count")?,
         })
     })?;
@@ -357,14 +469,14 @@ pub fn save_department(
         Some(id) => {
             conn.execute(
                 "UPDATE departments SET name=?1, code=?2, colour=?3, head_member_id=?4,
-                    default_timetable_id=?5 WHERE id=?6",
+                    default_shift_id=?5 WHERE id=?6",
                 params![name, code, colour, head, timetable, id],
             )?;
             Ok(id)
         }
         None => {
             conn.execute(
-                "INSERT INTO departments(name, code, colour, head_member_id, default_timetable_id)
+                "INSERT INTO departments(name, code, colour, head_member_id, default_shift_id)
                  VALUES(?1,?2,?3,?4,?5)",
                 params![name, code, colour, head, timetable],
             )?;
@@ -505,23 +617,14 @@ fn date_range(from: &str, to: &str) -> Result<Vec<String>> {
 /// correction the office made deliberately.
 pub fn recompute(conn: &mut Connection, from: &str, to: &str) -> Result<usize> {
     let dates = date_range(from, to)?;
-    let policy = Policy {
-        dedupe_secs: db::rule_i64(conn, "dedupe_window_sec", 60) as i32,
-        lone_punch_half_day: db::rule_bool(conn, "lone_punch_half_day", true),
-        require_both_punches: db::rule_bool(conn, "require_both_punches", true),
-        count_ot: db::rule_bool(conn, "count_ot", true),
-    };
+    let rules_set = AttendanceRules::load(conn)?;
+    let roster = Roster::load(conn)?;
 
-    // Load everything we need up front — per-day queries would make a month
-    // recompute unbearably slow on a school office PC.
-    let members: Vec<(i64, i64, Option<i64>, Option<i64>, String)> = {
-        let mut s = conn.prepare(
-            "SELECT m.id, m.enroll_no, m.timetable_id, d.default_timetable_id, m.status
-             FROM members m LEFT JOIN departments d ON d.id = m.dept_id",
-        )?;
-        let r = s.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })?;
+    // Everything the loop needs is read up front. Per-day queries made a
+    // month-end recompute slow enough that the office assumed it had hung.
+    let members: Vec<(i64, i64, String)> = {
+        let mut s = conn.prepare("SELECT id, enroll_no, status FROM members")?;
+        let r = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         r.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
@@ -539,7 +642,7 @@ pub fn recompute(conn: &mut Connection, from: &str, to: &str) -> Result<usize> {
         r.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    // All punches in range, grouped by (enroll, date).
+    // All punches in range, grouped by (enrolment, date).
     let mut punches: std::collections::HashMap<(i64, String), Vec<rules::Punch>> =
         std::collections::HashMap::new();
     {
@@ -569,39 +672,36 @@ pub fn recompute(conn: &mut Connection, from: &str, to: &str) -> Result<usize> {
     let tx = conn.transaction()?;
     {
         let mut up = tx.prepare(
-            "INSERT INTO attendance (member_id, work_date, in_time, out_time, worked_min,
-                 late_min, early_min, ot_min, status, remark, computed_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10, datetime('now','localtime'))
+            "INSERT INTO attendance (member_id, work_date, timetable_id, shift_id, in_time,
+                 out_time, worked_min, late_min, early_min, ot_min, weekend_ot_min,
+                 workday_value, exception, status, remark, computed_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15, datetime('now','localtime'))
              ON CONFLICT(member_id, work_date) DO UPDATE SET
+                 timetable_id=excluded.timetable_id, shift_id=excluded.shift_id,
                  in_time=excluded.in_time, out_time=excluded.out_time,
                  worked_min=excluded.worked_min, late_min=excluded.late_min,
                  early_min=excluded.early_min, ot_min=excluded.ot_min,
-                 status=excluded.status, remark=excluded.remark,
+                 weekend_ot_min=excluded.weekend_ot_min, workday_value=excluded.workday_value,
+                 exception=excluded.exception, status=excluded.status, remark=excluded.remark,
                  computed_at=excluded.computed_at
              WHERE attendance.manual = 0 AND attendance.locked = 0",
         )?;
 
-        // Cache plans per (timetable, weekday) — 4 timetables x 7 days at most.
-        let mut plan_cache: std::collections::HashMap<(i64, u32), Option<Shift>> =
+        // A member's plan repeats every cycle, so the same (member, day index)
+        // is asked for over and over across a month.
+        let mut plan_cache: std::collections::HashMap<(i64, String), crate::schedule::DayPlan> =
             std::collections::HashMap::new();
 
         for date in &dates {
             let weekday = weekday_of(date)?;
             let holiday = is_holiday(date);
 
-            for (mid, enroll, tt, dept_tt, status) in &members {
-                let timetable = tt.or(*dept_tt);
-
-                let shift = match timetable {
-                    Some(t) => match plan_cache.entry((t, weekday)) {
-                        std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            // Cannot call plan_for on `tx` borrow inside; query directly.
-                            let p = plan_for_tx(&e.key().0, weekday, &tx)?;
-                            *e.insert(p)
-                        }
-                    },
-                    None => None,
+            for (mid, enroll, status) in &members {
+                let plan = match plan_cache.entry((*mid, date.clone())) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(roster.plan_for(*mid, date)?).clone()
+                    }
                 };
 
                 let on_leave = status == "On Leave"
@@ -609,30 +709,37 @@ pub fn recompute(conn: &mut Connection, from: &str, to: &str) -> Result<usize> {
                         m == mid && date.as_str() >= f.as_str() && date.as_str() <= t.as_str()
                     });
 
+                // Order matters. A holiday outranks the weekend set, and both
+                // outrank the roster: a school holiday falling on a Saturday is
+                // still a holiday, and neither is a day anyone is late for.
                 let kind = if holiday {
                     DayKind::Holiday
                 } else if on_leave {
                     DayKind::ApprovedLeave
+                } else if rules_set.is_weekend(weekday) || plan.is_rest() {
+                    DayKind::Weekend
                 } else {
-                    match shift {
-                        Some(s) => DayKind::Working(s),
-                        None => DayKind::Off,
-                    }
+                    DayKind::Working
                 };
 
                 let empty = Vec::new();
                 let p = punches.get(&(*enroll, date.clone())).unwrap_or(&empty);
-                let r: DayResult = rules::compute_day(p, kind, &policy);
+                let r: DayResult = rules::compute_day(p, kind, &plan, &rules_set);
 
                 written += up.execute(params![
                     mid,
                     date,
+                    r.timetable_id,
+                    plan.shift_id,
                     r.in_time(),
                     r.out_time(),
                     r.worked_min as i64,
                     r.late_min as i64,
                     r.early_min as i64,
                     r.ot_min as i64,
+                    r.weekend_ot_min as i64,
+                    r.workday_value,
+                    r.exception.map(|e| e.as_str()),
                     r.status.as_str(),
                     r.remark,
                 ])?;
@@ -643,41 +750,6 @@ pub fn recompute(conn: &mut Connection, from: &str, to: &str) -> Result<usize> {
     Ok(written)
 }
 
-/// Look up the shift that applies to a timetable on a weekday.
-fn plan_for_tx(tt: &i64, weekday: u32, tx: &rusqlite::Transaction) -> Result<Option<Shift>> {
-    let row: Option<(String, String, i64, i64, i64, i64, i64, i64, i64, i64)> = tx
-        .query_row(
-            "SELECT s.start_time, s.end_time, s.late_grace, s.early_grace, s.break_min,
-                    s.min_full_day, s.half_day_after, s.absent_after, s.count_ot, s.min_ot_block
-             FROM timetable_days td JOIN shifts s ON s.id = td.shift_id
-             WHERE td.timetable_id = ?1 AND td.weekday = ?2",
-            params![tt, weekday],
-            |r| {
-                Ok((
-                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?,
-                    r.get(7)?, r.get(8)?, r.get(9)?,
-                ))
-            },
-        )
-        .optional()?;
-
-    let Some((start, end, lg, eg, br, mfd, hda, aa, ot, mob)) = row else {
-        return Ok(None);
-    };
-    let base = Shift::from_times(&start, &end)
-        .ok_or_else(|| Error::Invalid(format!("shift has invalid times {start}-{end}")))?;
-    Ok(Some(Shift {
-        late_grace: lg as i32,
-        early_grace: eg as i32,
-        break_min: br as i32,
-        min_full_day: mfd as i32,
-        half_day_after: hda as i32,
-        absent_after: aa as i32,
-        count_ot: ot != 0,
-        min_ot_block: mob as i32,
-        ..base
-    }))
-}
 
 // ---------------------------------------------------------------------------
 // Reading attendance
@@ -694,7 +766,8 @@ pub fn attendance_range(
     let mut sql = String::from(
         "SELECT a.member_id, m.enroll_no, m.full_name, d.name AS dept_name, d.colour AS dept_colour,
                 m.designation, a.work_date, a.in_time, a.out_time, a.worked_min, a.late_min,
-                a.early_min, a.ot_min, a.status, a.remark, a.manual, a.locked
+                a.early_min, a.ot_min, a.weekend_ot_min, a.workday_value, a.exception,
+                a.status, a.remark, a.manual, a.locked
          FROM attendance a
          JOIN members m ON m.id = a.member_id
          LEFT JOIN departments d ON d.id = m.dept_id
@@ -730,6 +803,9 @@ pub fn attendance_range(
             late_min: r.get("late_min")?,
             early_min: r.get("early_min")?,
             ot_min: r.get("ot_min")?,
+            weekend_ot_min: r.get("weekend_ot_min")?,
+            workday_value: r.get("workday_value")?,
+            exception: r.get("exception")?,
             status: r.get("status")?,
             remark: r.get("remark")?,
             manual: r.get::<_, i64>("manual")? != 0,
@@ -794,21 +870,23 @@ pub fn summary_for(
     member_id: i64,
 ) -> Result<Summary> {
     let rows = attendance_range(conn, from, to, None, Some(member_id), false)?;
-    Ok(rules::summarise(
-        &rows
-            .iter()
-            .map(|r| DayResult {
-                status: status_from_str(&r.status),
-                in_min: None,
-                out_min: None,
-                worked_min: r.worked_min as i32,
-                late_min: r.late_min as i32,
-                early_min: r.early_min as i32,
-                ot_min: r.ot_min as i32,
-                remark: None,
-            })
-            .collect::<Vec<_>>(),
-    ))
+    let rules_set = AttendanceRules::load(conn)?;
+    // Rebuild the day results from the stored figures rather than recomputing:
+    // a manual correction the office made by hand must show up in the total.
+    let days: Vec<DayResult> = rows
+        .iter()
+        .map(|r| {
+            let mut d = DayResult::blank(Status::parse(&r.status));
+            d.worked_min = r.worked_min as i32;
+            d.late_min = r.late_min as i32;
+            d.early_min = r.early_min as i32;
+            d.ot_min = r.ot_min as i32;
+            d.weekend_ot_min = r.weekend_ot_min as i32;
+            d.workday_value = r.workday_value;
+            d
+        })
+        .collect();
+    Ok(rules::summarise(&days, &rules_set))
 }
 
 pub fn status_from_str(s: &str) -> Status {

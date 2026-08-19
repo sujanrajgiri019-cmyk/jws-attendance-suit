@@ -179,12 +179,124 @@ impl Device {
         proto::parse_attlog_buffer(&result?)
     }
 
+    /// Read a large table through the device's buffer.
+    ///
+    /// Newer firmware will not serve the user table through a direct request;
+    /// it has to be staged into a buffer with `CMD_DATA_WRRQ` and then pulled
+    /// out in chunks. Small tables come back inline in the first reply, so both
+    /// paths are handled.
+    fn read_with_buffer(&mut self, table_cmd: u16, fct: i32) -> Result<Vec<u8>> {
+        const MAX_CHUNK: u32 = 0xFF_C0; // what the devices accept over TCP
+
+        let request = proto::build_wrrq_request(table_cmd, fct, 0);
+        let (header, body) = self.command(proto::CMD_DATA_WRRQ, &request)?;
+
+        match header.command {
+            // Small table: the device just handed it over.
+            proto::CMD_DATA => return Ok(body),
+
+            proto::CMD_ACK_OK | proto::CMD_PREPARE_DATA => {}
+
+            proto::CMD_ACK_ERROR | proto::CMD_ACK_UNAUTH => {
+                return Err(Error::Protocol(format!(
+                    "the terminal refused to prepare its data (reply {}). \
+                     If a COMM key is set on the device, enter it on the Devices screen.",
+                    header.command
+                )))
+            }
+            other => {
+                return Err(Error::Protocol(format!(
+                    "unexpected reply {other} when asking the terminal to prepare its data"
+                )))
+            }
+        }
+
+        // The reply carries a status byte then the total size as a u32.
+        if body.len() < 5 {
+            return Err(Error::Protocol(format!(
+                "the terminal announced its data size in {} bytes; 5 were expected",
+                body.len()
+            )));
+        }
+        let size = u32::from_le_bytes([body[1], body[2], body[3], body[4]]);
+
+        if size == 0 {
+            // Not an error: the table really is empty.
+            let _ = self.command(proto::CMD_FREE_DATA, &[]);
+            return Ok(Vec::new());
+        }
+        if size > 32 * 1024 * 1024 {
+            return Err(Error::Protocol(format!("the terminal announced {size} bytes")));
+        }
+
+        let mut out = Vec::with_capacity(size as usize);
+        let mut start: u32 = 0;
+        while start < size {
+            let want = MAX_CHUNK.min(size - start);
+            let req = proto::build_read_chunk_request(start, want);
+            let (h, chunk) = self.command(proto::CMD_READ_BUFFER, &req)?;
+
+            let piece = match h.command {
+                proto::CMD_DATA => chunk,
+                proto::CMD_PREPARE_DATA => {
+                    // Announced then streamed, same as the attendance path.
+                    let mut acc = Vec::with_capacity(want as usize);
+                    while (acc.len() as u32) < want {
+                        let (hh, part) = self.read_reply()?;
+                        match hh.command {
+                            proto::CMD_DATA => acc.extend_from_slice(&part),
+                            proto::CMD_ACK_OK => break,
+                            other => {
+                                return Err(Error::Protocol(format!(
+                                    "unexpected packet {other} while reading a chunk at offset {start}"
+                                )))
+                            }
+                        }
+                    }
+                    acc
+                }
+                other => {
+                    return Err(Error::Protocol(format!(
+                        "the terminal returned {other} instead of data at offset {start} of {size}"
+                    )))
+                }
+            };
+
+            if piece.is_empty() {
+                return Err(Error::Protocol(format!(
+                    "the terminal stopped sending at offset {start} of {size} bytes"
+                )));
+            }
+            out.extend_from_slice(&piece);
+            start += piece.len() as u32;
+        }
+
+        let _ = self.command(proto::CMD_FREE_DATA, &[]);
+        out.truncate(size as usize);
+        Ok(out)
+    }
+
     /// Fetch the user table.
     pub fn users(&mut self) -> Result<Vec<DeviceUser>> {
         self.disable()?;
-        let result = self.read_bulk(proto::CMD_USER_TEMP_RRQ, &[0x05, 0x00, 0x00, 0x00, 0x00]);
+        let result = self.read_with_buffer(proto::CMD_USER_TEMP_RRQ, proto::FCT_USER);
         let _ = self.enable();
-        proto::parse_user_buffer(&result?)
+
+        let raw = result?;
+        if raw.is_empty() {
+            return Err(Error::Protocol(
+                "The terminal reported no users at all. If staff are enrolled on it, \
+                 the device may be using an older protocol than this app expects."
+                    .into(),
+            ));
+        }
+        proto::parse_user_buffer(&raw).map_err(|e| {
+            Error::Protocol(format!(
+                "{e}. The terminal sent {} bytes, which does not divide into \
+                 either the 72-byte or 28-byte user record layout.",
+                raw.len()
+            ))
+        })
     }
 
     /// Create or update a user on the terminal.

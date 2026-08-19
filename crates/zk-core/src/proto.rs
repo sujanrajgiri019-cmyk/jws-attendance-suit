@@ -26,8 +26,15 @@ pub const CMD_AUTH: u16 = 1102;
 pub const CMD_PREPARE_DATA: u16 = 1500;
 pub const CMD_DATA: u16 = 1501;
 pub const CMD_FREE_DATA: u16 = 1502;
+/// Ask the device to prepare a large table in its buffer.
 pub const CMD_DATA_WRRQ: u16 = 1503;
-pub const CMD_DATA_RDY: u16 = 1504;
+/// Read a chunk out of that prepared buffer.
+pub const CMD_READ_BUFFER: u16 = 1504;
+
+/// Table selector used with `CMD_DATA_WRRQ`. 5 = the user table.
+pub const FCT_USER: i32 = 5;
+/// 8 = the attendance log.
+pub const FCT_ATTLOG: i32 = 8;
 
 pub const CMD_ACK_OK: u16 = 2000;
 pub const CMD_ACK_ERROR: u16 = 2001;
@@ -428,6 +435,30 @@ pub fn parse_user_buffer(buf: &[u8]) -> Result<Vec<DeviceUser>, Error> {
     )))
 }
 
+/// Build the request body for `CMD_DATA_WRRQ`.
+///
+/// Layout is `<b h i i>`: a leading 1, the table command, the table selector,
+/// and an extra word — 11 bytes, no padding. Newer firmware (yours reports
+/// Push Service 2.0.33S) only serves the user table this way; the older direct
+/// `CMD_USER_TEMP_RRQ` request returns nothing at all.
+pub fn build_wrrq_request(command: u16, fct: i32, ext: i32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(11);
+    b.push(1u8);
+    b.extend_from_slice(&(command as i16).to_le_bytes());
+    b.extend_from_slice(&fct.to_le_bytes());
+    b.extend_from_slice(&ext.to_le_bytes());
+    debug_assert_eq!(b.len(), 11);
+    b
+}
+
+/// Build the request body for `CMD_READ_BUFFER`: `<i i>` start and length.
+pub fn build_read_chunk_request(start: u32, size: u32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(8);
+    b.extend_from_slice(&start.to_le_bytes());
+    b.extend_from_slice(&size.to_le_bytes());
+    b
+}
+
 /// Encode a user for `CMD_SET_USER` in the 72-byte layout.
 pub fn encode_user_72(u: &DeviceUser) -> Vec<u8> {
     fn fixed(s: &str, n: usize) -> Vec<u8> {
@@ -636,6 +667,29 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(make_comm_key(0, 1234, 50), make_comm_key(0, 1235, 50));
         assert_ne!(make_comm_key(0, 1234, 50), make_comm_key(1, 1234, 50));
+    }
+
+    #[test]
+    fn wrrq_request_has_the_exact_layout_the_device_expects() {
+        // <b h i i> with no padding: 1 + 2 + 4 + 4 = 11 bytes.
+        let r = build_wrrq_request(CMD_USER_TEMP_RRQ, FCT_USER, 0);
+        assert_eq!(r.len(), 11, "a padded struct here makes the device return nothing");
+        assert_eq!(r[0], 1);
+        assert_eq!(i16::from_le_bytes([r[1], r[2]]), CMD_USER_TEMP_RRQ as i16);
+        assert_eq!(i32::from_le_bytes([r[3], r[4], r[5], r[6]]), FCT_USER);
+        assert_eq!(i32::from_le_bytes([r[7], r[8], r[9], r[10]]), 0);
+    }
+
+    #[test]
+    fn read_chunk_request_is_two_little_endian_words() {
+        let r = build_read_chunk_request(0, 0xFFC0);
+        assert_eq!(r.len(), 8);
+        assert_eq!(u32::from_le_bytes([r[0], r[1], r[2], r[3]]), 0);
+        assert_eq!(u32::from_le_bytes([r[4], r[5], r[6], r[7]]), 0xFFC0);
+
+        let r2 = build_read_chunk_request(0xFFC0, 512);
+        assert_eq!(u32::from_le_bytes([r2[0], r2[1], r2[2], r2[3]]), 0xFFC0);
+        assert_eq!(u32::from_le_bytes([r2[4], r2[5], r2[6], r2[7]]), 512);
     }
 
     #[test]

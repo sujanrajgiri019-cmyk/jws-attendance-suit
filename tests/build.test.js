@@ -106,6 +106,32 @@ test('every file that carries a version agrees', async () => {
   assert.equal(cargoVersion, pkg.version, 'Cargo.toml version differs from package.json');
 });
 
+test('no command runs on the thread that draws the window', async () => {
+  // Tauri executes a plain `#[tauri::command]` on the main thread — the same
+  // thread the webview paints from. One 8-second device connect there and the
+  // whole window locks up: the button spins, nothing repaints, and the office
+  // decides the app has crashed. `#[tauri::command(async)]` moves the call to a
+  // worker thread and costs nothing for the fast ones, so the rule is blanket
+  // rather than a judgement call per command — a judgement call is exactly what
+  // gets forgotten when the fiftieth command is added.
+  const src = await fs.readFile(
+    path.join(root, 'src-tauri', 'src', 'commands.rs'), 'utf8',
+  );
+  const lines = src.split('\n');
+  const offenders = [];
+  lines.forEach((line, i) => {
+    if (line.trim() === '#[tauri::command]') {
+      // Name the function underneath so the failure says what to fix.
+      const fn = lines.slice(i + 1, i + 3).join(' ').match(/fn\s+(\w+)/)?.[1];
+      offenders.push(fn || `line ${i + 1}`);
+    }
+  });
+  assert.deepEqual(offenders, [], 'these must be #[tauri::command(async)]');
+
+  const total = (src.match(/#\[tauri::command\(async\)\]/g) || []).length;
+  assert.ok(total > 40, `only ${total} commands found — did the file move?`);
+});
+
 test('updater is configured to actually produce its artifacts', async () => {
   // Tauri 2 emits no .sig and no latest.json unless this is switched on, and
   // the app then reports "could not fetch a valid release JSON" forever.

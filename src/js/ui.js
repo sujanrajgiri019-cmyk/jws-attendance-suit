@@ -96,11 +96,12 @@ export function addDays(iso, n) {
 export const monthStart = (iso) => `${iso.slice(0, 7)}-01`;
 
 const STATUS_TONE = {
-  Present: 'g', Late: 'y', HalfDay: 'y', Absent: 'r',
+  Present: 'g', Late: 'y', EarlyLeave: 'y', HalfDay: 'y', Absent: 'r',
   Leave: 'v', Holiday: 'b', WeeklyOff: 'n', MissingPunch: 'n',
 };
 const STATUS_LABEL = {
-  HalfDay: 'Half day', WeeklyOff: 'Weekly off', MissingPunch: 'Missing punch',
+  EarlyLeave: 'Left early', HalfDay: 'Half day',
+  WeeklyOff: 'Weekly off', MissingPunch: 'Missing punch',
 };
 
 export const statusTone = (s) => STATUS_TONE[s] || 'n';
@@ -168,7 +169,7 @@ let modalHost = null;
  * Resolves with whatever the clicked button's handler returns, or null if
  * dismissed.
  */
-export function modal({ title, subtitle, body, wide, buttons = [] }) {
+export function modal({ title, subtitle, body, wide, buttons = [], onMount }) {
   if (!modalHost) {
     modalHost = document.createElement('div');
     document.body.appendChild(modalHost);
@@ -215,6 +216,11 @@ export function modal({ title, subtitle, body, wide, buttons = [] }) {
         /* withBusy already reported it; keep the dialog open to correct it */
       }
     });
+
+    // Let the caller wire up controls inside the dialog body — a list that
+    // rebuilds itself, for instance. Runs after the markup is in the document
+    // so querySelector inside it finds things.
+    if (onMount) onMount(ov);
 
     // Focus the first field so the dialog is usable from the keyboard.
     setTimeout(() => ov.querySelector('input,select,textarea')?.focus(), 40);
@@ -265,7 +271,10 @@ export function table(el, columns, rows, { empty, emptyHint } = {}) {
   }
   el.innerHTML =
     `<thead><tr>${columns
-      .map((c) => `<th class="${c.cls || ''}" ${c.width ? `style="width:${c.width}"` : ''}>${esc(c.label)}</th>`)
+      // `rawLabel` lets a header hold markup — a select-all checkbox, for
+      // instance. Everything else is escaped, which is the safe default.
+      .map((c) => `<th class="${c.cls || ''}" ${c.width ? `style="width:${c.width}"` : ''}>${
+        c.rawLabel ? c.label : esc(c.label)}</th>`)
       .join('')}</tr></thead>` +
     `<tbody>${rows
       .map(
