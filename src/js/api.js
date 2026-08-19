@@ -59,6 +59,7 @@ export const api = {
   saveDevice: (device) => call('save_device', { device }),
   devicePing: (ip, port) => call('device_ping', { ip, port }),
   deviceInfo: (ip, port, commKey = 0) => call('device_info', { ip, port, commKey }),
+  deviceDiagnose: (ip, port) => call('device_diagnose', { ip, port }),
   downloadLogs: (ip, port, commKey, serial, clearAfter) =>
     call('device_download_logs', { ip, port, commKey, serial, clearAfter }),
   downloadUsers: (ip, port, commKey) => call('device_download_users', { ip, port, commKey }),

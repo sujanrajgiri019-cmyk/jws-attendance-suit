@@ -136,6 +136,7 @@ pub fn run() {
             commands::save_device,
             commands::device_ping,
             commands::device_info,
+            commands::device_diagnose,
             commands::device_download_logs,
             commands::device_download_users,
             commands::device_upload_users,

@@ -16,7 +16,36 @@ const ACTIONS = [
   { id: 'photos', label: 'Attendance photo management', icon: 'file' },
   { id: 'ac', label: 'AC manage', icon: 'lock' },
   { id: 'recompute', label: 'Recalculate attendance', icon: 'sync' },
+  { id: 'diagnose', label: 'Diagnose connection', icon: 'plug' },
 ];
+
+/** What each job actually does, in the office's terms rather than the protocol's. */
+const EXPLAIN = {
+  logs: {
+    title: 'Download attendance logs',
+    lead: 'Fetches every check-in and check-out the terminal has stored, so the '
+      + 'attendance report can be calculated from them.',
+    detail: 'Records already held here are skipped, so this is safe to run as often as '
+      + 'you like. Anything new is added and the affected days are recalculated '
+      + 'straight away — the reports are correct the moment this finishes.',
+  },
+  users_down: {
+    title: 'Download user info and fingerprints',
+    lead: 'Brings every person enrolled on the terminal into this software — their '
+      + 'enrolment number, name, card number, privilege level and fingerprint templates.',
+    detail: 'They appear on the Members screen as soon as this finishes. Names already '
+      + 'corrected here are never overwritten by the terminal\'s 24-character version; '
+      + 'only new people are added and only blank fields are filled in.',
+  },
+  users_up: {
+    title: 'Upload user info and fingerprints',
+    lead: 'Sends staff from this software to the terminal, so somebody added here can '
+      + 'scan at the gate without being enrolled on the device by hand.',
+    detail: 'Their name, enrolment number, card and privilege go across. Fingerprints '
+      + 'have to be enrolled at the terminal itself the first time — but once they are '
+      + 'downloaded here, this puts them back on a replacement device.',
+  },
+};
 
 export default {
   async mount(host) {
@@ -186,11 +215,21 @@ export default {
       host.querySelectorAll('#actNav button').forEach((b) =>
         b.classList.toggle('on', b.dataset.act === action));
 
+      if (action === 'diagnose') {
+        body.innerHTML = `
+          <div class="form-head"><h3>Diagnose connection</h3></div>
+          <p class="hint mb8">Checks what the terminal is actually doing, rather than what
+            it should be doing, and says which of the handful of causes is the real one.</p>
+          <button class="btn pri" id="go">${icon('plug')} Run diagnosis</button>
+          <div id="diagOut"></div>`;
+        return;
+      }
+
       if (action === 'logs') {
         body.innerHTML = `
-          <div class="form-head"><h3>Download attendance logs</h3></div>
-          <p class="hint mb8">Pull everything the terminal has stored. Records already held
-            are skipped, so this is safe to run at any time.</p>
+          <div class="form-head"><h3>${esc(EXPLAIN.logs.title)}</h3></div>
+          <p class="lead">${esc(EXPLAIN.logs.lead)}</p>
+          <p class="hint mb8">${esc(EXPLAIN.logs.detail)}</p>
           <div class="note b" id="modeNote">${icon('info')}<div></div></div>
           <label class="cb"><input type="checkbox" id="clearAfter">
             <div class="ct"><b>Clear the terminal log afterwards</b>
@@ -203,10 +242,9 @@ export default {
 
       if (action === 'users_down') {
         body.innerHTML = `
-          <div class="form-head"><h3>Download user info and fingerprints</h3></div>
-          <p class="hint mb8">Picks up anyone enrolled directly on the terminal keypad and
-            adds them here. Existing records are never overwritten — only new
-            enrolment numbers are added.</p>
+          <div class="form-head"><h3>${esc(EXPLAIN.users_down.title)}</h3></div>
+          <p class="lead">${esc(EXPLAIN.users_down.lead)}</p>
+          <p class="hint mb8">${esc(EXPLAIN.users_down.detail)}</p>
           <div class="note b" id="modeNote">${icon('info')}<div></div></div>
           <button class="btn pri" id="go">${icon('users')} Read users from terminal</button>`;
         paintModeNote();
@@ -215,8 +253,9 @@ export default {
 
       if (action === 'users_up') {
         body.innerHTML = `
-          <div class="form-head"><h3>Upload user info and fingerprints</h3></div>
-          <p class="hint mb8">Push names, privileges and card numbers to the terminal.</p>
+          <div class="form-head"><h3>${esc(EXPLAIN.users_up.title)}</h3></div>
+          <p class="lead">${esc(EXPLAIN.users_up.lead)}</p>
+          <p class="hint mb8">${esc(EXPLAIN.users_up.detail)}</p>
           <div class="fld"><label>Who to send</label>
             <div class="radios">
               <label class="rd"><input type="radio" name="scope" value="all" checked><span>Everyone</span></label>
@@ -373,6 +412,12 @@ export default {
             const n = await api.uploadUsers(ids);
             return `${n} update${n === 1 ? '' : 's'} queued for the terminal`;
           });
+        } else if (action === 'diagnose') {
+          say('info', 'Diagnosis: checking the terminal…');
+          const d = await api.deviceDiagnose(device.ip, device.port);
+          renderDiagnosis(d);
+          say(d.tcp_reachable || d.getrequest_count > 0 ? 'ok' : 'warn', d.verdict);
+          d.advice.split(/(?<=\.)\s+/).filter(Boolean).forEach((l) => say('info', l));
         } else if (action === 'recompute') {
           const from = body.querySelector('#recFrom').value;
           const to = body.querySelector('#recTo').value;
@@ -389,6 +434,48 @@ export default {
         btn.disabled = false;
       }
     });
+
+    /** Draw the diagnosis as something an office can read and act on. */
+    function renderDiagnosis(d) {
+      const out = body.querySelector('#diagOut');
+      if (!out) return;
+      const ok = (v) => (v ? '<span class="tag g">Yes</span>' : '<span class="tag r">No</span>');
+      const row = (label, value) =>
+        `<div class="stat-row"><span class="sl">${esc(label)}</span>
+           <span class="sv">${value}</span></div>`;
+
+      out.innerHTML = `
+        <div class="note ${d.tcp_reachable || d.getrequest_count > 0 ? 'b' : 'y'}"
+             style="margin:14px 0">${icon(d.tcp_reachable || d.getrequest_count > 0 ? 'info' : 'warn')}
+          <div><b>${esc(d.verdict)}</b><br>${esc(d.advice)}</div></div>
+
+        <div class="sec-lbl">What was checked</div>
+        ${row('Push listener running', ok(d.listener_running)
+          + (d.listener_port ? ` <span class="dim">port ${d.listener_port}</span>` : ''))}
+        ${row('Direct connection on port ' + d.port, ok(d.tcp_reachable)
+          + ` <span class="dim">${esc(d.tcp_detail)}</span>`)}
+        ${row('Last contact from the terminal', esc(d.last_contact || 'never'))}
+        ${row('Times it sent us data', `${d.cdata_count}`
+          + (d.last_cdata ? ` <span class="dim">last ${esc(d.last_cdata)}</span>` : ''))}
+        ${row('Times it asked for commands', `${d.getrequest_count}`
+          + (d.last_getrequest ? ` <span class="dim">last ${esc(d.last_getrequest)}</span>` : ''))}
+        ${row('Record types received', d.tables_seen.length
+          ? esc(d.tables_seen.join(', ')) : '<span class="dim">none</span>')}
+        ${row('Commands waiting', `${d.commands_pending}`)}
+        ${row('Commands collected', `${d.commands_sent}`)}
+        ${row('Serial on file', `<span class="mono">${esc(d.serial || '—')}</span>`)}
+        ${row('Mode', esc(d.mode))}
+
+        <div class="sec-lbl">Last 25 exchanges</div>
+        <div class="console" style="height:200px">${
+          d.recent.length
+            ? d.recent.map((r) => `<div class="ln">
+                <span class="ts">${esc(String(r.ts).slice(11))}</span>
+                <span class="${r.records ? 'ok' : 'info'}">${esc(r.method)} ${esc(r.endpoint)}${
+                  r.table ? ` [${esc(r.table)}]` : ''} → ${esc(r.reply)}</span></div>`).join('')
+            : '<div class="ln"><span class="info">The terminal has not contacted this PC at all.</span></div>'
+        }</div>`;
+    }
 
     async function loadHistory() {
       const rows = await api.syncHistory(15);

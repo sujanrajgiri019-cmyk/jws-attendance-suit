@@ -15,6 +15,7 @@ static MIGRATIONS: &[(&str, &str)] = &[
     ("001_initial", include_str!("../migrations/001_initial.sql")),
     ("002_seed", include_str!("../migrations/002_seed.sql")),
     ("003_scheduling", include_str!("../migrations/003_scheduling.sql")),
+    ("004_device_log", include_str!("../migrations/004_device_log.sql")),
 ];
 
 /// Open (creating if needed) the attendance database and bring it up to date.
@@ -167,6 +168,39 @@ pub fn log_sync(conn: &Connection, job: &str, device: &str, result: &str, ok: bo
         params![job, device, result, ok as i64],
     )?;
     Ok(())
+}
+
+/// Record one inbound request from a terminal.
+///
+/// Deliberately never fails the caller: losing a log line must not cost a
+/// punch. Errors are swallowed here rather than propagated into the socket
+/// handler.
+pub fn log_device_request(
+    conn: &Connection,
+    serial: &str,
+    method: &str,
+    endpoint: &str,
+    table: &str,
+    body_bytes: usize,
+    records: usize,
+    reply: &str,
+) {
+    let _ = conn.execute(
+        "INSERT INTO device_requests
+            (device_serial, method, endpoint, table_name, body_bytes, records, reply)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            serial,
+            method,
+            endpoint,
+            table,
+            body_bytes as i64,
+            records as i64,
+            // A reply is one short line; anything longer is a command payload
+            // and is trimmed so the log stays readable.
+            reply.chars().take(120).collect::<String>().trim().to_string()
+        ],
+    );
 }
 
 /// Insert raw punches, ignoring any that are already stored.
@@ -427,6 +461,30 @@ mod tests {
             .unwrap();
         assert_eq!(ip, "192.168.100.99");
         assert_eq!(serial, "GED7253800740");
+    }
+
+
+    #[test]
+    fn device_requests_are_logged_and_pruned() {
+        let conn = open_memory().unwrap();
+        for i in 0..20 {
+            log_device_request(&conn, "SN1", "POST", "/iclock/cdata", "ATTLOG", 100, i, "OK");
+        }
+        let n: i64 =
+            conn.query_row("SELECT count(*) FROM device_requests", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 20);
+
+        // A long reply is trimmed rather than stored whole.
+        log_device_request(&conn, "SN1", "GET", "/iclock/getrequest", "", 0, 0, &"x".repeat(500));
+        let reply: String = conn
+            .query_row("SELECT reply FROM device_requests ORDER BY id DESC LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(reply.len() <= 120, "reply not trimmed: {} chars", reply.len());
+
+        // Logging must never be able to fail a caller, even with odd input.
+        log_device_request(&conn, "", "", "", "", 0, 0, "");
     }
 
     #[test]

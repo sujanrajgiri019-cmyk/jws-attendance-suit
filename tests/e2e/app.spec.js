@@ -523,3 +523,41 @@ test('a fractional stepper does not produce floating point noise', async ({ page
   // 0.5 + 0.05 must read as 0.55, not 0.5500000000000001.
   await expect(unit).toHaveValue('0.55');
 });
+
+// ---------------------------------------------------------------------------
+// Data Transfer
+// ---------------------------------------------------------------------------
+
+test('each transfer job explains what it actually does', async ({ page }) => {
+  await page.click('#nav a[data-page="data"]');
+  for (const [act, phrase] of [
+    ['logs', 'check-in and check-out'],
+    ['users_down', 'enrolled on the terminal'],
+    ['users_up', 'from this software to the terminal'],
+  ]) {
+    await page.click(`#actNav [data-act="${act}"]`);
+    await expect(page.locator('#actBody .lead')).toContainText(phrase);
+  }
+});
+
+test('diagnose reports what the terminal is really doing', async ({ page }) => {
+  await page.click('#nav a[data-page="data"]');
+  await page.click('#actNav [data-act="diagnose"]');
+  await page.click('#actBody #go');
+
+  // The verdict, and the evidence behind it.
+  await expect(page.locator('#diagOut')).toContainText('never asks for commands');
+  await expect(page.locator('#diagOut')).toContainText('Times it asked for commands');
+  await expect(page.locator('#diagOut')).toContainText('Push listener running');
+  // And the raw exchange log, so the reasoning can be checked.
+  await expect(page.locator('#diagOut .console .ln').first()).toContainText('/iclock/');
+});
+
+test('the console narrates a transfer rather than sitting silent', async ({ page }) => {
+  await page.click('#nav a[data-page="data"]');
+  await page.click('#actNav [data-act="users_down"]');
+  await page.click('#actBody #go');
+  await expect(page.locator('#console')).toContainText('Download users: starting');
+  // Every line is stamped, so a failure can be placed in time afterwards.
+  await expect(page.locator('#console .ln .ts').first()).toContainText(/\d\d:\d\d:\d\d/);
+});

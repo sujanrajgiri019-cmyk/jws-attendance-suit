@@ -392,6 +392,259 @@ pub struct PullResult {
     pub recomputed: usize,
 }
 
+/// Store a batch of users read from a terminal.
+///
+/// Never overwrites a name the office has corrected here — the terminal's
+/// 24-character version is the worse of the two. Only new enrolments are added
+/// and only blank fields are filled in.
+fn store_users(c: &Connection, users: &[zk_core::proto::DeviceUser], serial: &str) -> R<usize> {
+    let mut added = 0usize;
+    for u in users {
+        let Ok(enroll) = u.user_id.trim().parse::<i64>() else { continue };
+        if enroll <= 0 {
+            continue;
+        }
+        let name = if u.name.trim().is_empty() {
+            format!("Unnamed {enroll}")
+        } else {
+            u.name.trim().to_string()
+        };
+        let exists: bool = c
+            .query_row("SELECT 1 FROM members WHERE enroll_no=?1", params![enroll], |_| Ok(true))
+            .unwrap_or(false);
+        if exists {
+            let _ = c.execute(
+                "UPDATE members
+                    SET card_no = COALESCE(NULLIF(card_no,''), ?2),
+                        privilege = ?3,
+                        device_name = COALESCE(NULLIF(device_name,''), ?4),
+                        updated_at = datetime('now','localtime')
+                  WHERE enroll_no = ?1",
+                params![enroll, u.card.to_string(), u.privilege as i64, name],
+            );
+        } else if c
+            .execute(
+                "INSERT INTO members (enroll_no, full_name, device_name, card_no, privilege, status)
+                 VALUES (?1, ?2, ?2, ?3, ?4, 'Active')",
+                params![enroll, name, u.card.to_string(), u.privilege as i64],
+            )
+            .is_ok()
+        {
+            added += 1;
+        }
+    }
+    let _ = db::audit(c, "admin", "members.imported", &format!("{added} from {serial}"));
+    Ok(added)
+}
+
+/// What the terminal is actually doing, as opposed to what it should be doing.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceDiagnosis {
+    pub serial: String,
+    pub ip: String,
+    pub port: u16,
+    pub mode: String,
+    /// Can this PC open a direct connection on port 4370?
+    pub tcp_reachable: bool,
+    pub tcp_detail: String,
+    pub listener_running: bool,
+    pub listener_port: u16,
+    pub last_contact: Option<String>,
+    /// How many times the device has asked us for work.
+    pub getrequest_count: i64,
+    pub last_getrequest: Option<String>,
+    pub cdata_count: i64,
+    pub last_cdata: Option<String>,
+    /// Which record types it has actually sent.
+    pub tables_seen: Vec<String>,
+    pub commands_pending: i64,
+    pub commands_sent: i64,
+    /// The last few exchanges, newest first.
+    pub recent: Vec<serde_json::Value>,
+    /// The one sentence that matters.
+    pub verdict: String,
+    pub advice: String,
+}
+
+/// Work out why a terminal is not doing what was asked of it.
+///
+/// Written after a K40 Pro spent two days accepting punches while ignoring
+/// every command queued for it. From outside, "the device polls for work and
+/// finds none" and "the device never polls at all" produce exactly the same
+/// silence — and they have completely different fixes. This tells them apart.
+#[tauri::command(async)]
+pub fn device_diagnose(state: State<'_, AppState>, ip: String, port: u16) -> R<DeviceDiagnosis> {
+    // The socket test happens first, without the database lock held: it can
+    // take seconds, and the push listener must stay free to write throughout.
+    let (tcp_reachable, tcp_detail) = match pull::ping(&ip, port, Duration::from_secs(4)) {
+        Ok(ms) => (true, format!("answered in {ms} ms")),
+        Err(e) => (false, e.to_string()),
+    };
+
+    let listener_running = state.push.lock().map(|g| g.is_some()).unwrap_or(false);
+    let listener_port = state
+        .push
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|p| p.port()))
+        .unwrap_or(0);
+
+    let c = conn(&state)?;
+
+    let (serial, mode): (String, String) = c
+        .query_row(
+            "SELECT COALESCE(serial,''), mode FROM devices WHERE ip = ?1 LIMIT 1",
+            params![ip],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or_default();
+
+    let last_contact: Option<String> = c
+        .query_row("SELECT last_seen FROM devices WHERE ip = ?1", params![ip], |r| r.get(0))
+        .ok()
+        .flatten();
+
+    let count = |endpoint: &str| -> (i64, Option<String>) {
+        let n: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM device_requests WHERE endpoint LIKE ?1",
+                params![format!("%{endpoint}%")],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let last: Option<String> = c
+            .query_row(
+                "SELECT ts FROM device_requests WHERE endpoint LIKE ?1 ORDER BY id DESC LIMIT 1",
+                params![format!("%{endpoint}%")],
+                |r| r.get(0),
+            )
+            .ok();
+        (n, last)
+    };
+
+    let (getrequest_count, last_getrequest) = count("getrequest");
+    let (cdata_count, last_cdata) = count("cdata");
+
+    let tables_seen: Vec<String> = c
+        .prepare("SELECT DISTINCT table_name FROM device_requests WHERE table_name <> ''")
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(0))
+                .and_then(|r| r.collect::<rusqlite::Result<Vec<_>>>())
+        })
+        .unwrap_or_default();
+
+    let commands_pending: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM device_commands WHERE sent_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let commands_sent: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM device_commands WHERE sent_at IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    let recent: Vec<serde_json::Value> = c
+        .prepare(
+            "SELECT ts, method, endpoint, table_name, records, reply
+             FROM device_requests ORDER BY id DESC LIMIT 25",
+        )
+        .and_then(|mut s| {
+            s.query_map([], |r| {
+                Ok(serde_json::json!({
+                    "ts": r.get::<_, String>(0)?,
+                    "method": r.get::<_, String>(1)?,
+                    "endpoint": r.get::<_, String>(2)?,
+                    "table": r.get::<_, String>(3)?,
+                    "records": r.get::<_, i64>(4)?,
+                    "reply": r.get::<_, String>(5)?,
+                }))
+            })
+            .and_then(|r| r.collect::<rusqlite::Result<Vec<_>>>())
+        })
+        .unwrap_or_default();
+
+    // The verdict, in the order the possibilities actually occur.
+    let (verdict, advice) = if !listener_running {
+        (
+            "The push listener is not running.".to_string(),
+            "Nothing can arrive from the terminal until it is started. Open the Devices \
+             screen and start the listener, then try again."
+                .to_string(),
+        )
+    } else if cdata_count == 0 && !tcp_reachable {
+        (
+            "This PC and the terminal cannot see each other at all.".to_string(),
+            format!(
+                "Nothing has ever arrived from the terminal, and {ip}:{port} does not answer \
+                 either. Check the IP address on the terminal's own network menu matches the \
+                 one on the Devices screen — a router handing out addresses changes it after \
+                 a power cut. Also check the terminal's server address points at this PC on \
+                 port {listener_port}."
+            ),
+        )
+    } else if cdata_count > 0 && getrequest_count == 0 {
+        (
+            "The terminal sends data but never asks for commands.".to_string(),
+            "This is the state where punches arrive normally and every download request is \
+             ignored forever. It means the terminal has not enabled its command channel. \
+             Reboot the terminal — it re-reads the server options on start-up, and this \
+             version sends the options that switch that channel on. If it still never asks, \
+             switch the terminal to Pull mode on the Devices screen and transfers will go \
+             over port 4370 instead."
+                .to_string(),
+        )
+    } else if commands_pending > 0 && getrequest_count > 0 {
+        (
+            format!("{commands_pending} command(s) are waiting to be collected."),
+            "The terminal is asking for work, so these should go out within its check-in \
+             interval. If they sit here, the serial number on the Devices screen probably \
+             does not match the one the terminal reports — commands are addressed by serial."
+                .to_string(),
+        )
+    } else if tcp_reachable {
+        (
+            "The terminal is reachable directly.".to_string(),
+            "Port 4370 answers, so transfers can run over a direct connection. Setting the \
+             terminal to Pull mode on the Devices screen is the fastest and most complete \
+             way to move users and logs."
+                .to_string(),
+        )
+    } else {
+        (
+            "The terminal is talking to this PC normally.".to_string(),
+            "Data is arriving and commands are being collected. Nothing needs attention."
+                .to_string(),
+        )
+    };
+
+    Ok(DeviceDiagnosis {
+        serial,
+        ip,
+        port,
+        mode,
+        tcp_reachable,
+        tcp_detail,
+        listener_running,
+        listener_port,
+        last_contact,
+        getrequest_count,
+        last_getrequest,
+        cdata_count,
+        last_cdata,
+        tables_seen,
+        commands_pending,
+        commands_sent,
+        recent,
+        verdict,
+        advice,
+    })
+}
+
 /// Ask a push-mode terminal for something, then wait for it to arrive.
 ///
 /// A push terminal cannot be dialled — it polls this PC for work, usually every
@@ -664,6 +917,55 @@ pub fn device_download_users(
     };
 
     if push_mode {
+        // Try the direct connection first even on a push-mode terminal. Many
+        // keep port 4370 open, and a direct read is instant and complete —
+        // whereas asking depends on the device choosing to come and collect the
+        // request. Four seconds is long enough to know, short enough not to
+        // annoy anyone when it fails.
+        let _ = app.emit(
+            "transfer-progress",
+            format!("Trying a direct connection to {ip}:{port}…"),
+        );
+        match pull::Device::connect(&ip, port, comm_key, Duration::from_secs(4)) {
+            Ok(mut dev) => {
+                let _ = app.emit("transfer-progress", "Connected — reading the user table…".to_string());
+                match dev.users() {
+                    Ok(users) => {
+                        let _ = dev.disconnect();
+                        let c = conn(&state)?;
+                        let n = store_users(&c, &users, &serial)?;
+                        let _ = db::log_sync(
+                            &c,
+                            "Download users",
+                            &serial,
+                            &format!("{n} added over a direct connection"),
+                            true,
+                        );
+                        let _ = app.emit(
+                            "transfer-progress",
+                            format!("{} users read directly from the terminal", users.len()),
+                        );
+                        return c
+                            .query_row("SELECT COUNT(*) FROM members", [], |r| r.get::<_, i64>(0))
+                            .map(|t| t as usize)
+                            .map_err(|e| e.to_string());
+                    }
+                    Err(e) => {
+                        let _ = app.emit(
+                            "transfer-progress",
+                            format!("Direct read failed ({e}) — asking the terminal to send instead."),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = app.emit(
+                    "transfer-progress",
+                    format!("No direct connection ({e}) — asking the terminal to send instead."),
+                );
+            }
+        }
+
         // Ask for the user list and the fingerprint templates together: "user
         // info and FP" should mean both, and the terminal sends them as two
         // separate posts.

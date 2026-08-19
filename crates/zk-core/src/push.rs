@@ -44,6 +44,15 @@ impl Default for PushConfig {
 /// `stamp` is the high-water mark of records we have already accepted; the
 /// device resends anything newer. Passing 0 asks for everything it holds.
 pub fn handshake_response(serial: &str, stamp: u64, cfg: &PushConfig) -> String {
+    // ServerVer and PushProtVer are what tell the terminal it is talking to a
+    // real ADMS server rather than something that merely accepts posts. Without
+    // them a K40 Pro will happily send its attendance log and then never poll
+    // /iclock/getrequest again — so punches arrive, every command queued for the
+    // device is ignored forever, and nothing in the exchange looks broken.
+    //
+    // TransFlag goes out as the numeric bitmask. The named form is accepted by
+    // newer firmware only; the digits are understood by all of it, and each one
+    // switches on a class of record the device may send us.
     format!(
         "GET OPTION FROM: {sn}\r\n\
          Stamp={stamp}\r\n\
@@ -52,10 +61,16 @@ pub fn handshake_response(serial: &str, stamp: u64, cfg: &PushConfig) -> String 
          Delay={delay}\r\n\
          TransTimes=00:00;14:00\r\n\
          TransInterval=1\r\n\
-         TransFlag=TransData AttLog\tOpLog\tAttPhoto\tEnrollFP\tEnrollUser\tFPImag\tUserPic\r\n\
+         TransFlag=1111111111\r\n\
          TimeZone={tz}\r\n\
          Realtime={rt}\r\n\
-         Encrypt=0\r\n",
+         Encrypt=0\r\n\
+         ServerVer=2.4.1 {stamp}\r\n\
+         PushProtVer=2.4.1\r\n\
+         PushOptionsFlag=1\r\n\
+         ATTLOGStamp=None\r\n\
+         OPERLOGStamp=9999\r\n\
+         ATTPHOTOStamp=None\r\n",
         sn = serial,
         stamp = stamp,
         err = cfg.error_delay_secs,
@@ -415,6 +430,38 @@ mod tests {
     }
 
 
+
+
+    #[test]
+    fn the_handshake_advertises_a_real_adms_server() {
+        // Without ServerVer and PushProtVer a K40 Pro posts its attendance log
+        // and then never polls for commands. Nothing errors; the command queue
+        // simply fills up forever. These four lines are what prevent that, so
+        // they are pinned.
+        let r = handshake_response("GED7253800740", 42, &PushConfig::default());
+        assert!(r.contains("ServerVer="), "missing ServerVer:\n{r}");
+        assert!(r.contains("PushProtVer="), "missing PushProtVer:\n{r}");
+        assert!(r.contains("PushOptionsFlag=1"), "missing PushOptionsFlag:\n{r}");
+        assert!(r.starts_with("GET OPTION FROM: GED7253800740"));
+    }
+
+    #[test]
+    fn the_handshake_sends_the_numeric_transflag() {
+        // Older firmware does not understand the named list form and quietly
+        // sends nothing at all.
+        let r = handshake_response("SN", 1, &PushConfig::default());
+        assert!(r.contains("TransFlag=1111111111"), "{r}");
+        assert!(!r.contains("TransFlag=TransData"), "named form is not universally understood");
+    }
+
+    #[test]
+    fn every_handshake_line_ends_the_way_the_device_expects() {
+        let r = handshake_response("SN", 7, &PushConfig::default());
+        for line in r.split("\r\n").filter(|l| !l.is_empty()) {
+            assert!(!line.contains('\n'), "bare newline inside a line: {line:?}");
+        }
+        assert!(r.ends_with("\r\n"), "the last line must be terminated too");
+    }
 
     #[test]
     fn parses_a_fingerprint_post() {

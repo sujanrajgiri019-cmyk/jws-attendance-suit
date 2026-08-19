@@ -68,7 +68,26 @@ pub fn start(
                 if !flag.load(Ordering::SeqCst) {
                     break;
                 }
-                let response = handle(&app, &db, &mut request);
+
+                // Everything the terminal says is recorded before we answer it.
+                // A device that posts punches but never asks for commands looks
+                // identical from the outside to one that asks and finds none —
+                // and the two have completely different fixes.
+                let url = request.url().to_string();
+                let method = request.method().as_str().to_string();
+                let serial = push::query_param(&url, "SN").unwrap_or_default();
+                let table = push::query_param(&url, "table").unwrap_or_default();
+                let endpoint = url.split('?').next().unwrap_or(&url).to_string();
+
+                let outcome = handle(&app, &db, &mut request);
+                let (response, records, reply) = outcome;
+
+                if let Ok(conn) = db.lock() {
+                    zk_core::db::log_device_request(
+                        &conn, &serial, &method, &endpoint, &table, 0, records, &reply,
+                    );
+                }
+
                 if let Err(e) = request.respond(response) {
                     tracing::warn!("failed to answer terminal: {e}");
                 }
@@ -89,17 +108,21 @@ fn text(body: String) -> Response<std::io::Cursor<Vec<u8>>> {
     r
 }
 
+/// Answer one request, and report how many records it carried plus the reply
+/// we gave — both of which go into the device log.
+type Handled = (Response<std::io::Cursor<Vec<u8>>>, usize, String);
+
 fn handle(
     app: &AppHandle,
     db: &Arc<Mutex<Connection>>,
     request: &mut tiny_http::Request,
-) -> Response<std::io::Cursor<Vec<u8>>> {
+) -> Handled {
     let url = request.url().to_string();
     let method = request.method().as_str().to_string();
     let serial = push::query_param(&url, "SN").unwrap_or_default();
 
     if serial.is_empty() {
-        return text("OK\r\n".into());
+        return (text("OK\r\n".into()), 0, "OK (no serial)".into());
     }
 
     // Any contact at all means the terminal is alive.
@@ -111,7 +134,8 @@ fn handle(
     if url.starts_with("/iclock/cdata") && method == "GET" {
         tracing::info!("terminal {serial} completed handshake");
         let _ = app.emit("device-online", serial.clone());
-        return text(push::handshake_response(&serial, 0, &PushConfig::default()));
+        let body = push::handshake_response(&serial, 0, &PushConfig::default());
+        return (text(body), 0, "handshake".into());
     }
 
     // --- records ---------------------------------------------------------
@@ -120,7 +144,7 @@ fn handle(
         let mut body = String::new();
         if request.as_reader().read_to_string(&mut body).is_err() {
             // A truncated body is not worth failing over; the terminal resends.
-            return text("OK\r\n".into());
+            return (text("OK\r\n".into()), 0, "truncated body".into());
         }
 
         // Fingerprint templates, which arrive as their own table alongside the
@@ -176,7 +200,7 @@ fn handle(
                 }
             }
             let _ = app.emit("transfer-progress", format!("{stored} fingerprint templates"));
-            return text(format!("OK: {stored}\r\n"));
+            return (text(format!("OK: {stored}\r\n")), stored, format!("OK: {stored} templates"));
         }
 
         // The user table, usually arriving because the Data Transfer screen
@@ -248,17 +272,21 @@ fn handle(
                     );
                 }
             }
-            return text(format!("OK: {}\r\n", users.len()));
+            return (
+                text(format!("OK: {}\r\n", users.len())),
+                users.len(),
+                format!("OK: {} users", users.len()),
+            );
         }
 
         if !table.eq_ignore_ascii_case("ATTLOG") {
             // Anything else is acknowledged so the device moves on.
-            return text("OK\r\n".into());
+            return (text("OK\r\n".into()), 0, format!("ignored table {table}"));
         }
 
         let logs = push::parse_attlog_body(&body);
         if logs.is_empty() {
-            return text("OK: 0\r\n".into());
+            return (text("OK: 0\r\n".into()), 0, "OK: 0 (empty)".into());
         }
 
         let mut accepted = 0usize;
@@ -355,7 +383,11 @@ fn handle(
         }
 
         // The device uses this count to advance its own pointer.
-        return text(format!("OK: {accepted}\r\n"));
+        return (
+            text(format!("OK: {accepted}\r\n")),
+            accepted,
+            format!("OK: {accepted} punches"),
+        );
     }
 
     // --- device asking for work ------------------------------------------
@@ -377,10 +409,17 @@ fn handle(
                     params![id],
                 );
                 tracing::info!("handed command {id} to {serial}");
-                return text(format!("{payload}\r\n"));
+                return (
+                    text(format!("{payload}\r\n")),
+                    1,
+                    format!("sent command {id}: {payload}"),
+                );
             }
         }
-        return text("OK\r\n".into());
+        // The device asked for work and there was none. Logged explicitly,
+        // because "asked and found nothing" and "never asked" are the two
+        // possibilities that matter and they must be distinguishable.
+        return (text("OK\r\n".into()), 0, "no commands pending".into());
     }
 
     // --- device reporting a command result --------------------------------
@@ -399,10 +438,10 @@ fn handle(
                 );
             }
         }
-        return text("OK\r\n".into());
+        return (text("OK\r\n".into()), 0, format!("command result: {body}"));
     }
 
-    text("OK\r\n".into())
+    (text("OK\r\n".into()), 0, "OK".into())
 }
 
 /// Queue a command for a terminal to collect on its next poll.

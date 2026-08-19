@@ -784,6 +784,26 @@ export function createDemo() {
     },
     bs_calendar: () => BS_TABLE,
 
+    device_diagnose: ({ ip, port }) => ({
+      serial: 'GED7253800740', ip, port, mode: 'push',
+      tcp_reachable: false, tcp_detail: 'connection timed out',
+      listener_running: true, listener_port: 8081,
+      last_contact: '2026-08-19 14:22:01',
+      getrequest_count: 0, last_getrequest: null,
+      cdata_count: 184, last_cdata: '2026-08-19 14:22:01',
+      tables_seen: ['ATTLOG'],
+      commands_pending: 2, commands_sent: 0,
+      recent: [
+        { ts: '2026-08-19 14:22:01', method: 'POST', endpoint: '/iclock/cdata',
+          table: 'ATTLOG', records: 3, reply: 'OK: 3 punches' },
+        { ts: '2026-08-19 14:21:04', method: 'GET', endpoint: '/iclock/cdata',
+          table: '', records: 0, reply: 'handshake' },
+      ],
+      verdict: 'The terminal sends data but never asks for commands.',
+      advice: 'This is the state where punches arrive normally and every download request '
+        + 'is ignored forever. Reboot the terminal so it re-reads the server options.',
+    }),
+
     get_attendance_rules: () => ({ ...demoRules }),
     save_attendance_rules: ({ rules: r }) => {
       // Mirror the backend's own refusal, so the screen can be exercised.
