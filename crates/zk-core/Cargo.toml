@@ -1,0 +1,24 @@
+[package]
+name = "zk-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Pure-Rust core: protocol, database, rules engine, calendar.
+# Deliberately has NO Tauri dependency so it can be unit-tested
+# on any machine with `cargo test -p zk-core`.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+rusqlite = { workspace = true }
+tracing = { workspace = true }
+pbkdf2 = { version = "0.12", default-features = false }
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

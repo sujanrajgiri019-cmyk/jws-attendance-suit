@@ -1,0 +1,46 @@
+[package]
+name = "jws-attendance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Staff attendance management for Janapremi World School"
+default-run = "jws-attendance"
+
+[lib]
+name = "jws_attendance_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+
+zk-core = { path = "../crates/zk-core" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+rusqlite = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Minimal blocking HTTP server for the ADMS push listener. The terminal is the
+# client here, so nothing async is needed — one thread per connection is ample
+# for a handful of gates.
+tiny_http = "0.12"
+
+# Gmail SMTP for absence notices and password recovery.
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport", "builder", "rustls-tls", "pool", "hostname",
+] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"
+tauri-plugin-single-instance = "2"
+
+[features]
+# Tauri's default; keeps `cargo test` from needing a display server.
+default = []

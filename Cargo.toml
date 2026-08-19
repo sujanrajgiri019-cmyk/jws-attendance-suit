@@ -1,0 +1,25 @@
+[workspace]
+members = ["crates/zk-core", "src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.77"
+authors = ["Janapremi World School"]
+license = "Proprietary"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+tracing = "0.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

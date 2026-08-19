@@ -1,0 +1,27 @@
+# Build output
+/dist
+/target
+/src-tauri/target
+/src-tauri/gen
+node_modules/
+
+# Playwright
+/test-results
+/playwright-report
+/shots
+
+# Local database and backups — never commit school data
+*.db
+*.db-wal
+*.db-shm
+/backup
+
+# Signing keys must never reach the repository
+*.key
+*.key.pub
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

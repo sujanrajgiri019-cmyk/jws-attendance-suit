@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JWS Attendance — Janapremi World School</title>
+  <link rel="icon" href="assets/crest.png">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+  <!-- Sign-in gate. Replaced by the application once authenticated. -->
+  <div class="gate" id="gate" hidden>
+    <form class="gate-card" id="gateForm">
+      <img src="assets/logo-full.png" alt="Janapremi World School">
+      <h2>Attendance Suite</h2>
+      <p class="sub">Sign in to manage staff attendance</p>
+      <div class="gate-err" id="gateErr" hidden></div>
+      <div class="fld">
+        <label for="gateUser">Username</label>
+        <input class="inp" id="gateUser" name="username" value="admin" autocomplete="username">
+      </div>
+      <div class="fld">
+        <label for="gatePass">Password</label>
+        <input class="inp" id="gatePass" name="password" type="password"
+               autocomplete="current-password" placeholder="Enter your password">
+      </div>
+      <button class="btn pri" style="width:100%" type="submit" id="gateBtn">Sign in</button>
+      <div class="gate-foot">
+        <a href="#" id="gateForgot">Forgotten the password?</a>
+      </div>
+    </form>
+  </div>
+
+  <div class="app" id="app" hidden>
+    <aside class="sb">
+      <div class="sb-brand">
+        <img src="assets/crest.png" alt="">
+        <div class="bt">
+          <b>Janapremi World School</b>
+          <span>Attendance Suite</span>
+        </div>
+      </div>
+
+      <div class="sb-scroll">
+        <nav class="nav" id="nav"></nav>
+      </div>
+
+      <div class="sb-foot">
+        <div class="upd" id="updBox" hidden>
+          <span class="dot"></span>
+          <div class="ut"><b>Update available</b><span id="updVer"></span></div>
+        </div>
+        <div class="sb-ver" id="verLabel">JWS Attendance</div>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="top">
+        <div class="tt">
+          <h1 id="pgTitle">Dashboard</h1>
+          <p id="pgSub"></p>
+        </div>
+        <div class="top-r">
+          <div class="clock">
+            <b id="clkTime">—</b>
+            <span id="clkDate">—</span>
+          </div>
+          <div class="dev-chip" id="devChip">
+            <span class="d"></span><span id="devChipText">Checking…</span>
+          </div>
+          <button class="ibtn" id="btnRefresh" title="Refresh"></button>
+          <div class="who" id="whoBtn">
+            <div class="av">SR</div>
+            <div class="wt"><b id="whoName">Administrator</b><span id="whoRole">Signed in</span></div>
+          </div>
+        </div>
+      </header>
+
+      <div class="banner" id="defaultPwBanner" hidden>
+        <span id="bannerIcon"></span>
+        <span class="sp">
+          This computer is still using the default password
+          <b>Attendance@123</b>. Change it before handing the machine to office staff.
+        </span>
+        <button class="btn sm" id="bannerFix">Change password</button>
+      </div>
+
+      <main class="page" id="page"></main>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts"></div>
+  <script src="app.js"></script>
+</body>
+</html>

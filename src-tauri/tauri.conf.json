@@ -1,0 +1,69 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "JWS Attendance",
+  "version": "1.0.0",
+  "identifier": "np.edu.janapremi.attendance",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "JWS Attendance \u2014 Janapremi World School",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1180,
+        "minHeight": 700,
+        "resizable": true,
+        "center": true,
+        "decorations": true,
+        "theme": "Light"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "publisher": "Janapremi World School",
+    "copyright": "Janapremi World School, Madhyapur Thimi-3, Kaushaltar, Bhaktapur",
+    "shortDescription": "Staff attendance management",
+    "longDescription": "Staff attendance management for Janapremi World School, working with ZKTeco fingerprint terminals.",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "offlineInstaller"
+      },
+      "nsis": {
+        "installMode": "perMachine",
+        "languages": [
+          "English"
+        ],
+        "displayLanguageSelector": false
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/sujanrajgiri019-cmyk/jws-attendance-suit/releases/latest/download/latest.json"
+      ],
+      "dialog": true,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJCMkE2RkRCMURBNDA0MTAKUldRUUJLUWQyMjhxSy9qTHpHRUtRSGVuQUdUZlpCeUlFSTFEaEd0Skk2LzZRcWw2bjFwZHFUY3EK"
+    }
+  }
+}
