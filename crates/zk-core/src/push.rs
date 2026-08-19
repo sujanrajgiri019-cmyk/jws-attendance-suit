@@ -65,6 +65,61 @@ pub fn handshake_response(serial: &str, stamp: u64, cfg: &PushConfig) -> String 
     )
 }
 
+/// One fingerprint template as the terminal reports it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PushFinger {
+    pub pin: String,
+    /// Which finger, 0-9.
+    pub index: u8,
+    pub size: i64,
+    pub valid: bool,
+    /// The device's own template blob, base64 as it arrived.
+    pub template: String,
+}
+
+/// Parse a `table=FINGERTMP` body.
+///
+/// ```text
+/// FP PIN=41\tFID=0\tSize=1024\tValid=1\tTMP=TUp3AAAA...
+/// ```
+///
+/// The template is kept exactly as the terminal sent it. It is a vendor blob,
+/// not something to interpret — re-encoding it would risk making it unusable
+/// when it is uploaded back to a replacement device, which is the entire point
+/// of storing it.
+pub fn parse_fingerprint_body(body: &str) -> Vec<PushFinger> {
+    let mut out = Vec::new();
+
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let rest = line.strip_prefix("FP").unwrap_or(line).trim_start();
+
+        let mut f = PushFinger { valid: true, ..Default::default() };
+        for field in rest.split('\t') {
+            let Some((k, v)) = field.split_once('=') else { continue };
+            match k.trim() {
+                "PIN" | "PIN2" => f.pin = v.trim().to_string(),
+                "FID" => f.index = v.trim().parse().unwrap_or(0),
+                "Size" => f.size = v.trim().parse().unwrap_or(0),
+                "Valid" => f.valid = v.trim() != "0",
+                // The template itself may contain '=' padding, so take the
+                // whole remainder rather than splitting again.
+                "TMP" => f.template = v.trim().to_string(),
+                _ => {}
+            }
+        }
+
+        if f.pin.trim().parse::<i64>().is_err() || f.template.is_empty() || f.index > 9 {
+            continue;
+        }
+        out.push(f);
+    }
+    out
+}
+
 /// One user record as the terminal reports it over ADMS.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PushUser {
@@ -283,6 +338,8 @@ pub enum DeviceCommand {
     QueryAttlog { from: String, to: String },
     /// Ask the device to re-send its user table.
     QueryUserInfo,
+    /// Ask the device to re-send every fingerprint template.
+    QueryFingerprints,
 }
 
 impl DeviceCommand {
@@ -305,6 +362,9 @@ impl DeviceCommand {
             ),
             // An empty PIN means every user.
             DeviceCommand::QueryUserInfo => format!("C:{id}:DATA QUERY USERINFO PIN="),
+            DeviceCommand::QueryFingerprints => {
+                format!("C:{id}:DATA QUERY FINGERTMP PIN=")
+            }
         }
     }
 }
@@ -343,6 +403,7 @@ mod tests {
             DeviceCommand::Reboot,
             DeviceCommand::ClearLog,
             DeviceCommand::QueryUserInfo,
+            DeviceCommand::QueryFingerprints,
             DeviceCommand::QueryAttlog { from: "2026-01-01".into(), to: "2026-01-31".into() },
             DeviceCommand::DeleteUser { pin: "41".into() },
         ];
@@ -353,6 +414,43 @@ mod tests {
         }
     }
 
+
+
+    #[test]
+    fn parses_a_fingerprint_post() {
+        let body = "FP PIN=41\tFID=0\tSize=1024\tValid=1\tTMP=QUJDRA==\n\
+                    FP PIN=41\tFID=1\tSize=980\tValid=1\tTMP=RUZHSA==\n";
+        let fps = parse_fingerprint_body(body);
+        assert_eq!(fps.len(), 2);
+        assert_eq!(fps[0].pin, "41");
+        assert_eq!(fps[0].index, 0);
+        assert_eq!(fps[0].size, 1024);
+        assert!(fps[0].valid);
+        // Base64 padding must survive: a truncated template is a useless one.
+        assert_eq!(fps[0].template, "QUJDRA==");
+        assert_eq!(fps[1].index, 1);
+    }
+
+    #[test]
+    fn a_template_containing_equals_signs_is_kept_whole() {
+        // Splitting on every '=' would cut base64 padding off the end and leave
+        // a blob the terminal rejects when it is uploaded back.
+        let body = "FP PIN=7\tFID=2\tTMP=YWJjZGVmZ2hpams=";
+        assert_eq!(parse_fingerprint_body(body)[0].template, "YWJjZGVmZ2hpams=");
+    }
+
+    #[test]
+    fn fingerprint_records_without_a_template_or_a_pin_are_skipped() {
+        let body = "FP PIN=41\tFID=0\tSize=0\tTMP=\n\
+                    FP PIN=\tFID=0\tTMP=QUJD\n\
+                    FP PIN=abc\tFID=0\tTMP=QUJD\n\
+                    FP PIN=8\tFID=11\tTMP=QUJD\n\
+                    FP PIN=9\tFID=3\tTMP=QUJD\n";
+        let fps = parse_fingerprint_body(body);
+        assert_eq!(fps.len(), 1, "only the usable template should survive");
+        assert_eq!(fps[0].pin, "9");
+        assert_eq!(fps[0].index, 3);
+    }
 
     #[test]
     fn parses_a_userinfo_post() {

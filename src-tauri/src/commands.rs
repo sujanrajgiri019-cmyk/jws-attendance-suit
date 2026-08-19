@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use rusqlite::{params, params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use zk_core::service::{self, MemberInput};
 use zk_core::{auth, calendar, db, pull, push};
@@ -392,6 +392,102 @@ pub struct PullResult {
     pub recomputed: usize,
 }
 
+/// Ask a push-mode terminal for something, then wait for it to arrive.
+///
+/// A push terminal cannot be dialled — it polls this PC for work, usually every
+/// few seconds. Queuing the request and returning immediately is technically
+/// correct and completely useless to the person who pressed the button: nothing
+/// appears, and there is no way to tell whether it worked.
+///
+/// So the command blocks until the data lands, watching `sync_log` for the row
+/// the push listener writes when it stores what arrived. It runs on a worker
+/// thread, so the window stays live throughout, and it releases the database
+/// lock between checks — holding it would stop the listener writing the very
+/// rows being waited for.
+fn queue_and_wait(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    serial: &str,
+    jobs: &[&str],
+    commands: Vec<zk_core::push::DeviceCommand>,
+    wait: Duration,
+) -> R<String> {
+    // Anything already in the log is history, not this request's answer.
+    let baseline: i64 = {
+        let c = conn(state)?;
+        for cmd in &commands {
+            crate::push_server::queue_command(&c, serial, cmd)?;
+        }
+        c.query_row("SELECT COALESCE(MAX(id), 0) FROM sync_log", [], |r| r.get(0))
+            .unwrap_or(0)
+    };
+
+    let _ = app.emit("transfer-progress", "Waiting for the terminal to check in…".to_string());
+
+    let started = std::time::Instant::now();
+    let mut results: Vec<String> = Vec::new();
+    let mut quiet_since: Option<std::time::Instant> = None;
+
+    while started.elapsed() < wait {
+        std::thread::sleep(Duration::from_millis(400));
+
+        let fresh: Vec<(String, String)> = {
+            let Ok(c) = conn(state) else { continue };
+            let mut stmt = match c.prepare(
+                "SELECT job, result FROM sync_log WHERE id > ?1 ORDER BY id",
+            ) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let rows = stmt
+                .query_map(params![baseline], |r| Ok((r.get(0)?, r.get(1)?)))
+                .and_then(|r| r.collect::<rusqlite::Result<Vec<_>>>())
+                .unwrap_or_default();
+            rows
+        };
+
+        let mut matched: Vec<String> = fresh
+            .iter()
+            .filter(|(job, _)| jobs.iter().any(|j| job == j))
+            .map(|(job, result)| format!("{job}: {result}"))
+            .collect();
+
+        if matched.len() > results.len() {
+            for line in matched.iter().skip(results.len()) {
+                let _ = app.emit("transfer-progress", line.clone());
+            }
+            results.clear();
+            results.append(&mut matched);
+            // More may still be coming — a user list is often followed by its
+            // fingerprint templates as a separate post.
+            quiet_since = Some(std::time::Instant::now());
+            continue;
+        }
+
+        // Once something has arrived, stop after a short lull rather than
+        // sitting out the whole timeout.
+        if let Some(t) = quiet_since {
+            if t.elapsed() > Duration::from_secs(4) {
+                break;
+            }
+        }
+    }
+
+    if results.is_empty() {
+        return Err(format!(
+            "The request was sent, but {} did not answer within {} seconds.\n\n\
+             The terminal only picks up requests when it checks in. Make sure it is \
+             switched on and on the same network, and that the push listener is running \
+             (the status chip at the top of the window should say 'Listening').\n\n\
+             If scans are arriving normally, try again — the check-in interval on some \
+             terminals is a minute or more.",
+            if serial.is_empty() { "the terminal" } else { serial },
+            wait.as_secs()
+        ));
+    }
+    Ok(results.join(" · "))
+}
+
 /// Is this terminal set up to dial out to us, rather than to be dialled?
 ///
 /// A device in ADMS/push mode almost always closes its direct TCP port: the
@@ -442,6 +538,7 @@ fn pull_advice(c: &Connection, ip: &str, port: u16, serial: &str, err: &str) -> 
 /// Pull-mode fetch of the terminal's stored attendance log.
 #[tauri::command(async)]
 pub fn device_download_logs(
+    app: AppHandle,
     state: State<'_, AppState>,
     ip: String,
     port: u16,
@@ -463,21 +560,49 @@ pub fn device_download_logs(
             let to = c
                 .query_row("SELECT date('now','localtime')", [], |r| r.get::<_, String>(0))
                 .unwrap_or_else(|_| "2030-01-01".into());
+            let before: i64 = c
+                .query_row("SELECT COUNT(*) FROM punches", [], |r| r.get(0))
+                .unwrap_or(0);
+            drop(c);
 
-            crate::push_server::queue_command(
-                &c,
-                &serial,
-                &zk_core::push::DeviceCommand::QueryAttlog { from, to },
-            )?;
+            let mut cmds = vec![zk_core::push::DeviceCommand::QueryAttlog { from, to }];
             if clear_after {
-                crate::push_server::queue_command(
-                    &c,
-                    &serial,
-                    &zk_core::push::DeviceCommand::ClearLog,
-                )?;
+                // Queued after the query, so the terminal only erases what it
+                // has already handed over.
+                cmds.push(zk_core::push::DeviceCommand::ClearLog);
             }
-            let _ = db::log_sync(&c, "Request logs", &serial, "queued for the terminal", true);
-            return Ok(PullResult { fetched: 0, accepted: 0, duplicates: 0, recomputed: 0 });
+            let summary =
+                queue_and_wait(&app, &state, &serial, &["Receive punches"], cmds,
+                               Duration::from_secs(120))?;
+
+            let mut c = conn(&state)?;
+            let after: i64 = c
+                .query_row("SELECT COUNT(*) FROM punches", [], |r| r.get(0))
+                .unwrap_or(before);
+            let accepted = (after - before).max(0) as usize;
+
+            // Records that arrive in bulk are for days already closed, so the
+            // whole requested span is rebuilt rather than just today.
+            let recomputed = if accepted > 0 {
+                let (f, t): (String, String) = c
+                    .query_row(
+                        "SELECT MIN(date(punch_time)), MAX(date(punch_time)) FROM punches",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap_or_default();
+                service::recompute(&mut c, &f, &t).unwrap_or(0)
+            } else {
+                0
+            };
+
+            let _ = db::log_sync(&c, "Download logs", &serial, &summary, true);
+            return Ok(PullResult {
+                fetched: accepted,
+                accepted,
+                duplicates: 0,
+                recomputed,
+            });
         }
     }
 
@@ -521,29 +646,45 @@ pub fn device_download_logs(
 
 #[tauri::command(async)]
 pub fn device_download_users(
+    app: AppHandle,
     state: State<'_, AppState>,
     ip: String,
     port: u16,
     comm_key: u32,
 ) -> R<usize> {
-    {
+    let (serial, push_mode) = {
         let c = conn(&state)?;
         let serial: String = c
             .query_row("SELECT COALESCE(serial,'') FROM devices WHERE ip=?1", params![ip], |r| {
                 r.get(0)
             })
             .unwrap_or_default();
-        if is_push_device(&c, &ip, &serial) {
-            crate::push_server::queue_command(
-                &c,
-                &serial,
-                &zk_core::push::DeviceCommand::QueryUserInfo,
-            )?;
-            let _ = db::log_sync(&c, "Request users", &serial, "queued for the terminal", true);
-            // Nothing has arrived yet; the caller reports it as a request, not
-            // as a count of users added.
-            return Ok(0);
-        }
+        let mode = is_push_device(&c, &ip, &serial);
+        (serial, mode)
+    };
+
+    if push_mode {
+        // Ask for the user list and the fingerprint templates together: "user
+        // info and FP" should mean both, and the terminal sends them as two
+        // separate posts.
+        let summary = queue_and_wait(
+            &app,
+            &state,
+            &serial,
+            &["Receive users", "Receive fingerprints"],
+            vec![
+                zk_core::push::DeviceCommand::QueryUserInfo,
+                zk_core::push::DeviceCommand::QueryFingerprints,
+            ],
+            Duration::from_secs(120),
+        )?;
+
+        let c = conn(&state)?;
+        let _ = db::log_sync(&c, "Download users", &serial, &summary, true);
+        return c
+            .query_row("SELECT COUNT(*) FROM members", [], |r| r.get::<_, i64>(0))
+            .map(|n| n as usize)
+            .map_err(|e| e.to_string());
     }
 
     let mut dev = pull::Device::connect(&ip, port, comm_key, Duration::from_secs(8))

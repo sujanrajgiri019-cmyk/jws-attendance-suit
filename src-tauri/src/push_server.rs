@@ -123,6 +123,62 @@ fn handle(
             return text("OK\r\n".into());
         }
 
+        // Fingerprint templates, which arrive as their own table alongside the
+        // user list. Stored verbatim so they can be pushed back to a
+        // replacement terminal.
+        if table.eq_ignore_ascii_case("FINGERTMP") {
+            let fps = push::parse_fingerprint_body(&body);
+            let mut stored = 0usize;
+            if let Ok(conn) = db.lock() {
+                for f in &fps {
+                    let Ok(enroll) = f.pin.trim().parse::<i64>() else { continue };
+                    if conn
+                        .execute(
+                            "INSERT INTO member_fingerprints
+                                (enroll_no, finger_index, template, size, valid, device_serial,
+                                 updated_at)
+                             VALUES (?1,?2,?3,?4,?5,?6, datetime('now','localtime'))
+                             ON CONFLICT(enroll_no, finger_index) DO UPDATE SET
+                                 template=excluded.template, size=excluded.size,
+                                 valid=excluded.valid, device_serial=excluded.device_serial,
+                                 updated_at=excluded.updated_at",
+                            params![
+                                enroll,
+                                f.index as i64,
+                                f.template,
+                                f.size,
+                                f.valid as i64,
+                                serial
+                            ],
+                        )
+                        .is_ok()
+                    {
+                        stored += 1;
+                    }
+                }
+                // Keep the count on the member record in step, so the Members
+                // screen shows who is actually enrolled on the sensor.
+                let _ = conn.execute(
+                    "UPDATE members SET fp_count = (
+                         SELECT COUNT(*) FROM member_fingerprints f
+                         WHERE f.enroll_no = members.enroll_no AND f.valid = 1)",
+                    [],
+                );
+                tracing::info!("terminal {serial}: {stored} fingerprint templates stored");
+                if stored > 0 {
+                    let _ = zk_core::db::log_sync(
+                        &conn,
+                        "Receive fingerprints",
+                        &serial,
+                        &format!("{stored} templates"),
+                        true,
+                    );
+                }
+            }
+            let _ = app.emit("transfer-progress", format!("{stored} fingerprint templates"));
+            return text(format!("OK: {stored}\r\n"));
+        }
+
         // The user table, usually arriving because the Data Transfer screen
         // asked for it. Handled before ATTLOG so a requested download actually
         // lands instead of being acknowledged and thrown away.
@@ -186,6 +242,10 @@ fn handle(
                         true,
                     );
                     let _ = app.emit("users-received", added as i64);
+                    let _ = app.emit(
+                        "transfer-progress",
+                        format!("{added} users added, {updated} updated"),
+                    );
                 }
             }
             return text(format!("OK: {}\r\n", users.len()));
@@ -207,6 +267,19 @@ fn handle(
                 Ok((a, dup)) => {
                     accepted = a;
                     tracing::info!("terminal {serial}: {a} new punches, {dup} already held");
+                    let _ = app.emit(
+                        "transfer-progress",
+                        format!("{a} new punches received, {dup} already held"),
+                    );
+                    // Logged so a Download-logs request can tell that its
+                    // answer has landed, rather than guessing from a timeout.
+                    let _ = zk_core::db::log_sync(
+                        &conn,
+                        "Receive punches",
+                        &serial,
+                        &format!("{a} new, {dup} already held"),
+                        true,
+                    );
 
                     // Recompute only the days actually touched, so a live punch
                     // updates the dashboard without rebuilding the month.

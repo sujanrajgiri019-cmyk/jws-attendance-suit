@@ -101,15 +101,26 @@ export default {
       }
       say('info', `${name}: starting…`);
       progress(15);
+      // A transfer can sit waiting on the terminal's check-in. Creep the bar so
+      // the screen never looks frozen, but stop short of 90 so it cannot claim
+      // to be finished before it is.
+      const creep = setInterval(() => {
+        const cur = parseFloat(prog.querySelector('i').style.width) || 15;
+        if (cur < 88) progress(cur + (88 - cur) * 0.06);
+      }, 700);
       try {
         const msg = await fn();
+        clearInterval(creep);
         progress(100);
         say('ok', `${name}: ${msg}`);
         toast('ok', msg);
         await loadHistory();
       } catch (e) {
+        clearInterval(creep);
         progress(null);
-        say('error', `${name} failed — ${e.message || e}`);
+        // Backend messages are written to be read; keep the line breaks.
+        String(e.message || e).split('\n').filter(Boolean).forEach((line, i) =>
+          say('error', i === 0 ? `${name} failed — ${line}` : line));
         toast('err', e.message || String(e));
         return;
       }
@@ -267,9 +278,10 @@ export default {
       const note = body.querySelector('#modeNote div');
       if (!note) return;
       note.innerHTML = device?.mode === 'push'
-        ? `<b>${esc(device.name)} is in push mode.</b> It sends to this PC rather than
-           being dialled, so this asks the terminal to send and the data arrives on its
-           next check-in — usually within a minute. Watch the console below.`
+        ? `<b>${esc(device.name)} is in push mode.</b> It reports to this PC rather than
+           being dialled, so this asks the terminal to send everything and then waits for
+           it to arrive — usually a few seconds, up to two minutes if the terminal has a
+           long check-in interval. Progress appears in the console below.`
         : 'This dials the terminal directly on port 4370. A full terminal takes up to a '
           + 'minute; the app stays usable while it works.';
     }
@@ -342,20 +354,17 @@ export default {
           await job('Download attendance logs', async () => {
             const r = await api.downloadLogs(
               device.ip, device.port, device.comm_key || 0, device.serial || '', !!clear);
-            if (device.mode === 'push') {
-              return 'Requested from the terminal — records arrive on its next check-in';
-            }
-            return `${r.fetched} records read, ${r.accepted} new, ${r.duplicates} already held`;
+            return device.mode === 'push'
+              ? `${r.accepted} new record${r.accepted === 1 ? '' : 's'} received${
+                  r.recomputed ? `, ${r.recomputed} day records rebuilt` : ''}`
+              : `${r.fetched} records read, ${r.accepted} new, ${r.duplicates} already held`;
           });
         } else if (action === 'users_down') {
           await job('Download users', async () => {
             const n = await api.downloadUsers(device.ip, device.port, device.comm_key || 0);
             // A push-mode terminal is asked rather than dialled, so nothing has
             // arrived yet. Saying "0 users" would read as a failure.
-            if (device.mode === 'push') {
-              return 'Requested from the terminal — the list arrives on its next check-in';
-            }
-            return n ? `${n} new user${n === 1 ? '' : 's'} added` : 'No new users on the terminal';
+            return `${n} staff now in the database`;
           });
         } else if (action === 'users_up') {
           const ids = chosenIds();
@@ -398,12 +407,21 @@ export default {
       say('info', `Scan · enrolment ${p.enroll_no} at ${String(p.punch_time).slice(11, 16)}`);
     });
 
+    // The backend narrates a transfer as it happens — waiting for the terminal
+    // to check in, then what each batch contained.
+    const stopProgress = await listen('transfer-progress', (line) => {
+      say('info', String(line));
+    });
+
     wireDateFields(body);
     paintAction();
     say('info', 'Console ready.');
     await testDevice();
     await loadHistory();
 
-    return () => { if (typeof stop === 'function') stop(); };
+    return () => {
+      if (typeof stop === 'function') stop();
+      if (typeof stopProgress === 'function') stopProgress();
+    };
   },
 };
