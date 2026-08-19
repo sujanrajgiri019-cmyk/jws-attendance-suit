@@ -54,7 +54,8 @@
         ],
         "displayLanguageSelector": false
       }
-    }
+    },
+    "createUpdaterArtifacts": true
   },
   "plugins": {
     "updater": {

@@ -331,8 +331,36 @@ export default {
           if (!updater?.check) {
             throw new Error('The updater is not available in this build.');
           }
-          const update = await updater.check();
           const state = body.querySelector('#updState');
+          const repo = settings.update_repo || 'the configured repository';
+
+          let update;
+          try {
+            update = await updater.check();
+          } catch (err) {
+            // Tauri's own wording here is opaque to anyone who is not a
+            // developer, and every likely cause has a different fix. Translate
+            // it into something the office can act on.
+            const raw = String(err?.message || err);
+            let friendly;
+            if (/release JSON|404|Not Found/i.test(raw)) {
+              friendly =
+                `No published version was found at ${repo}. Either no release has been ` +
+                `created yet, or the build is still running. Check the Actions tab on GitHub.`;
+            } else if (/signature|pubkey|minisign/i.test(raw)) {
+              friendly =
+                'A version was found, but it is not signed with this school\'s key, so it was ' +
+                'refused. That is the safety check working. Rebuild the release with the ' +
+                'signing key set.';
+            } else if (/network|dns|connect|timed? ?out|resolve/i.test(raw)) {
+              friendly = 'Could not reach GitHub. Check the internet connection and try again.';
+            } else {
+              friendly = `Could not check for updates: ${raw}`;
+            }
+            state.textContent = friendly;
+            throw new Error(friendly);
+          }
+
           if (!update) {
             state.textContent = 'This is the latest version.';
             toast('ok', 'You are up to date');
