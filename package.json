@@ -1,6 +1,6 @@
 {
   "name": "jws-attendance",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "private": true,
   "description": "Staff attendance management for Janapremi World School",
   "type": "module",
