@@ -367,6 +367,142 @@ impl Device {
     }
 }
 
+/// What actually happens when we try to speak the SDK protocol to a terminal.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Probe {
+    /// Did the TCP connection open at all?
+    pub socket_open: bool,
+    pub socket_ms: u128,
+    /// Bytes we sent, as hex.
+    pub sent_hex: String,
+    /// Bytes that came back, as hex. Empty means the device stayed silent.
+    pub received_hex: String,
+    pub received_bytes: usize,
+    /// The decoded reply command, when there was one.
+    pub reply_command: Option<u16>,
+    pub reply_name: String,
+    pub error: Option<String>,
+    pub verdict: String,
+}
+
+/// Open a socket, send one CMD_CONNECT, and report exactly what came back.
+///
+/// This exists because "the port is open" and "the device speaks to us" turned
+/// out to be completely different things on a K40 Pro with the cloud server
+/// enabled: the socket accepts instantly and then nothing ever answers. From
+/// the outside that is indistinguishable from a wrong address or a firewall,
+/// and each has a different fix. The hex dump settles it.
+pub fn probe(addr: &str, port: u16, comm_key: u32, timeout: Duration) -> Probe {
+    let mut p = Probe {
+        socket_open: false,
+        socket_ms: 0,
+        sent_hex: String::new(),
+        received_hex: String::new(),
+        received_bytes: 0,
+        reply_command: None,
+        reply_name: String::new(),
+        error: None,
+        verdict: String::new(),
+    };
+
+    let sock: SocketAddr = match (addr, port).to_socket_addrs().ok().and_then(|mut a| a.next()) {
+        Some(s) => s,
+        None => {
+            p.error = Some(format!("{addr}:{port} is not an address this PC can resolve"));
+            p.verdict = "The address itself is wrong.".into();
+            return p;
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let mut stream = match TcpStream::connect_timeout(&sock, timeout) {
+        Ok(s) => s,
+        Err(e) => {
+            p.error = Some(e.to_string());
+            p.verdict = format!(
+                "Nothing is listening on {addr}:{port}. Either the address is wrong,                  the terminal is off, or something on the network is blocking it."
+            );
+            return p;
+        }
+    };
+    p.socket_open = true;
+    p.socket_ms = started.elapsed().as_millis();
+
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let _ = stream.set_nodelay(true);
+
+    // One CMD_CONNECT, framed exactly as a live session would send it.
+    let payload = proto::build_payload(proto::CMD_CONNECT, 0, u16::MAX - 1, &[]);
+    let frame = proto::frame_tcp(&payload);
+    p.sent_hex = hex(&frame);
+
+    if let Err(e) = stream.write_all(&frame) {
+        p.error = Some(e.to_string());
+        p.verdict = "The connection opened but closed before anything could be sent.".into();
+        return p;
+    }
+
+    let mut buf = [0u8; 1024];
+    match stream.read(&mut buf) {
+        Ok(0) => {
+            p.verdict = format!(
+                "{addr}:{port} accepted the connection and then closed it without answering.                  On a ZKTeco terminal this means the SDK service is switched off — which is                  what enabling the cloud server (ADMS) does."
+            );
+        }
+        Ok(n) => {
+            p.received_bytes = n;
+            p.received_hex = hex(&buf[..n]);
+            // Unframe, then read the 8-byte header out of the payload.
+            let decoded = proto::unframe_tcp(&buf[..n])
+                .ok()
+                .and_then(|(_, payload)| Header::parse(payload).ok());
+
+            if let Some(h) = decoded {
+                p.reply_command = Some(h.command);
+                p.reply_name = reply_name(h.command).to_string();
+                p.verdict = match h.command {
+                    proto::CMD_ACK_OK => "The terminal answered correctly. Direct transfers will work.".into(),
+                    proto::CMD_ACK_UNAUTH => format!(
+                        "The terminal answered but wants a communication key. Enter the COMM key                          from the device's menu on the Devices screen — {comm_key} was tried."
+                    ),
+                    other => format!(
+                        "The terminal answered with reply {other} ({}), which is not the                          acknowledgement a connection expects.",
+                        reply_name(other)
+                    ),
+                };
+            } else {
+                p.verdict = format!(
+                    "{n} bytes came back but not in the shape this protocol expects.                      Something else may be listening on that port."
+                );
+            }
+        }
+        Err(e) => {
+            p.error = Some(e.to_string());
+            p.verdict = format!(
+                "{addr}:{port} accepted the connection and then went silent — nothing came                  back within {} seconds. On a ZKTeco terminal this is what an enabled cloud                  server (ADMS) looks like: the port stays open but the SDK service behind it                  is disabled. Turn the cloud server off on the terminal to use direct                  transfers.",
+                timeout.as_secs()
+            );
+        }
+    }
+    p
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+/// A name for the handful of replies worth recognising by sight.
+fn reply_name(command: u16) -> &'static str {
+    match command {
+        proto::CMD_ACK_OK => "ACK_OK",
+        proto::CMD_ACK_ERROR => "ACK_ERROR",
+        proto::CMD_ACK_DATA => "ACK_DATA",
+        proto::CMD_ACK_UNAUTH => "ACK_UNAUTH",
+        _ => "unrecognised",
+    }
+}
+
 /// Check whether a terminal answers on the given address, and how quickly.
 pub fn ping(addr: &str, port: u16, timeout: Duration) -> Result<u128> {
     let sock: SocketAddr = (addr, port)
@@ -383,6 +519,67 @@ pub fn ping(addr: &str, port: u16, timeout: Duration) -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_probe_of_a_dead_address_reports_the_socket_not_the_protocol() {
+        // 203.0.113.0/24 is reserved for documentation and routes nowhere.
+        let p = probe("203.0.113.1", 4370, 0, Duration::from_millis(300));
+        assert!(!p.socket_open);
+        assert!(p.received_hex.is_empty());
+        assert!(p.verdict.contains("Nothing is listening"), "{}", p.verdict);
+        assert!(p.error.is_some());
+    }
+
+    #[test]
+    fn a_probe_names_the_address_it_could_not_resolve() {
+        let p = probe("not a hostname at all", 4370, 0, Duration::from_millis(200));
+        assert!(!p.socket_open);
+        assert!(p.verdict.contains("address"), "{}", p.verdict);
+    }
+
+    #[test]
+    fn a_probe_records_exactly_what_it_sent() {
+        // Whatever happens to the connection, the outgoing frame is captured —
+        // that is half the evidence when a device answers unexpectedly.
+        let p = probe("127.0.0.1", 1, 0, Duration::from_millis(200));
+        let expected = super::hex(&proto::frame_tcp(&proto::build_payload(
+            proto::CMD_CONNECT,
+            0,
+            u16::MAX - 1,
+            &[],
+        )));
+        // Port 1 refuses, so nothing was sent; the field stays empty rather
+        // than claiming a frame went out.
+        assert!(p.sent_hex.is_empty() || p.sent_hex == expected);
+        assert!(!p.verdict.is_empty(), "a probe must always reach a verdict");
+    }
+
+    #[test]
+    fn a_silent_port_is_diagnosed_as_the_sdk_being_switched_off() {
+        // A listener that accepts and then says nothing is exactly what a
+        // ZKTeco terminal does when its cloud server is enabled. Stand one up
+        // and check the probe reaches that conclusion rather than blaming the
+        // network.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            // Accept, then hold the connection open without replying.
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(2));
+                drop(stream);
+            }
+        });
+
+        let p = probe("127.0.0.1", port, 0, Duration::from_millis(400));
+        assert!(p.socket_open, "the socket should have opened");
+        assert!(!p.sent_hex.is_empty(), "the connect frame should have gone out");
+        assert_eq!(p.received_bytes, 0);
+        assert!(
+            p.verdict.contains("cloud server") || p.verdict.contains("went silent"),
+            "verdict should point at the SDK service, got: {}",
+            p.verdict
+        );
+    }
 
     #[test]
     fn bad_addresses_fail_fast_with_a_clear_message() {

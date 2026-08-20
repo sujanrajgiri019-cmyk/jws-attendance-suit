@@ -561,3 +561,32 @@ test('the console narrates a transfer rather than sitting silent', async ({ page
   // Every line is stamped, so a failure can be placed in time afterwards.
   await expect(page.locator('#console .ln .ts').first()).toContainText(/\d\d:\d\d:\d\d/);
 });
+
+test('diagnose shows the protocol probe, not just a socket test', async ({ page }) => {
+  await page.click('#nav a[data-page="data"]');
+  await page.click('#actNav [data-act="diagnose"]');
+  await page.click('#actBody #go');
+  // A socket that opens and then says nothing is the case that matters.
+  await expect(page.locator('#diagOut')).toContainText('Direct connection probe');
+  await expect(page.locator('#diagOut')).toContainText('Bytes sent');
+  await expect(page.locator('#diagOut')).toContainText('nothing');
+  await expect(page.locator('#diagOut')).toContainText('cloud server');
+});
+
+test('the spreadsheet route offers export and import', async ({ page }) => {
+  await page.click('#nav a[data-page="data"]');
+  await page.click('#actNav [data-act="sheet"]');
+  await expect(page.locator('#actBody .lead')).toContainText('without needing the terminal');
+  await expect(page.locator('#csvOut')).toBeVisible();
+  await expect(page.locator('#csvIn')).toBeVisible();
+});
+
+test('importing a staff list reports what happened to every row', async ({ page }) => {
+  await page.click('#nav a[data-page="data"]');
+  await page.click('#actNav [data-act="sheet"]');
+  await page.click('#csvIn');
+  await page.locator('.mdl .btn.pri').click();
+  await expect(page.locator('#console')).toContainText('41 updated');
+  // Problems are surfaced, not swallowed.
+  await expect(page.locator('#console')).toContainText('has no name');
+});

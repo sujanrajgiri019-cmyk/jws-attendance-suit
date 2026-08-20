@@ -6,7 +6,7 @@
 // says nothing is what makes an office restart the app mid-sync.
 
 import { api, listen } from '../api.js';
-import { icon, esc, toast, table, todayIso, monthStart, confirmDialog } from '../ui.js';
+import { icon, esc, toast, table, todayIso, monthStart, confirmDialog, modal } from '../ui.js';
 import { dateField, wireDateFields, bsPretty } from '../nepali.js';
 
 const ACTIONS = [
@@ -16,6 +16,7 @@ const ACTIONS = [
   { id: 'photos', label: 'Attendance photo management', icon: 'file' },
   { id: 'ac', label: 'AC manage', icon: 'lock' },
   { id: 'recompute', label: 'Recalculate attendance', icon: 'sync' },
+  { id: 'sheet', label: 'Staff by spreadsheet', icon: 'file' },
   { id: 'diagnose', label: 'Diagnose connection', icon: 'plug' },
 ];
 
@@ -215,6 +216,26 @@ export default {
       host.querySelectorAll('#actNav button').forEach((b) =>
         b.classList.toggle('on', b.dataset.act === action));
 
+      if (action === 'sheet') {
+        body.innerHTML = `
+          <div class="form-head"><h3>Staff by spreadsheet</h3></div>
+          <p class="lead">Names every person the terminal has seen, without needing the
+            terminal to cooperate.</p>
+          <p class="hint mb8">Staff appear here automatically the first time they scan, as
+            "Unnamed 41". Export that list, type the real names beside the enrolment numbers
+            in Excel, and import it back. Rows are matched on enrolment number, so nothing
+            can attach to the wrong person.</p>
+          <div class="grid2">
+            <button class="btn" id="csvOut">${icon('down')} Export staff list</button>
+            <button class="btn pri" id="csvIn">${icon('up')} Import filled-in list</button>
+          </div>
+          <div class="note b" style="margin-top:14px">${icon('info')}<div>
+            Only the <b>Enrolment</b> and <b>Name</b> columns are required. Department must
+            match one that already exists, or it is left unset and reported.
+          </div></div>`;
+        return;
+      }
+
       if (action === 'diagnose') {
         body.innerHTML = `
           <div class="form-head"><h3>Diagnose connection</h3></div>
@@ -381,6 +402,41 @@ export default {
     });
 
     body.addEventListener('click', async (e) => {
+      if (e.target.closest('#csvOut')) {
+        const path = `staff-list-${todayIso()}.csv`;
+        await job('Export staff list', async () => {
+          const p = await api.exportMembersCsv(path);
+          await api.openPath(p).catch(() => {});
+          return `written to ${p} — fill in the Name column and import it back`;
+        });
+        return;
+      }
+      if (e.target.closest('#csvIn')) {
+        const path = await modal({
+          title: 'Import staff list',
+          subtitle: 'A spreadsheet saved as CSV',
+          body: `<div class="fld"><label>File name</label>
+              <input class="inp" name="p" value="staff-list-${todayIso()}.csv"></div>
+            <div class="note b">${icon('info')}<div>
+              Save the spreadsheet from Excel as <b>CSV UTF-8</b> so Nepali names survive.
+              Existing people are updated; new enrolment numbers are added.
+            </div></div>`,
+          buttons: [
+            { label: 'Cancel', value: null },
+            { label: 'Import', kind: 'pri',
+              onClick: (ov) => ov.querySelector('[name=p]').value.trim() },
+          ],
+        });
+        if (!path) return;
+        await job('Import staff list', async () => {
+          const r = await api.importMembersCsv(path);
+          r.problems.slice(0, 20).forEach((x) => say('warn', x));
+          if (r.problems.length > 20) say('warn', `… and ${r.problems.length - 20} more`);
+          return `${r.added} added, ${r.updated} updated${
+            r.skipped ? `, ${r.skipped} skipped` : ''}`;
+        });
+        return;
+      }
       if (!e.target.closest('#go')) return;
       const btn = e.target.closest('#go');
       btn.disabled = true;
@@ -412,6 +468,8 @@ export default {
             const n = await api.uploadUsers(ids);
             return `${n} update${n === 1 ? '' : 's'} queued for the terminal`;
           });
+        } else if (action === 'sheet') {
+          // Handled by its own buttons below.
         } else if (action === 'diagnose') {
           say('info', 'Diagnosis: checking the terminal…');
           const d = await api.deviceDiagnose(device.ip, device.port);
@@ -465,6 +523,21 @@ export default {
         ${row('Commands collected', `${d.commands_sent}`)}
         ${row('Serial on file', `<span class="mono">${esc(d.serial || '—')}</span>`)}
         ${row('Mode', esc(d.mode))}
+
+        <div class="sec-lbl">Direct connection probe</div>
+        <p class="hint mb8">A socket opening is not the same as the terminal talking to us.
+          This sends one real protocol packet and shows what came back.</p>
+        ${row('Socket opened', ok(d.probe.socket_open)
+          + (d.probe.socket_open ? ` <span class="dim">${d.probe.socket_ms} ms</span>` : ''))}
+        ${row('Bytes sent', `<span class="mono" style="font-size:10.5px">${
+          esc(d.probe.sent_hex || '—')}</span>`)}
+        ${row('Bytes received', d.probe.received_bytes
+          ? `<span class="mono" style="font-size:10.5px">${esc(d.probe.received_hex)}</span>`
+          : '<span class="tag r">nothing</span>')}
+        ${row('Decoded reply', esc(d.probe.reply_name || '—'))}
+        <div class="note ${d.probe.reply_command ? 'b' : 'y'}" style="margin:10px 0">
+          ${icon(d.probe.reply_command ? 'info' : 'warn')}
+          <div>${esc(d.probe.verdict)}</div></div>
 
         <div class="sec-lbl">Last 25 exchanges</div>
         <div class="console" style="height:200px">${

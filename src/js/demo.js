@@ -784,6 +784,10 @@ export function createDemo() {
     },
     bs_calendar: () => BS_TABLE,
 
+    export_members_csv: ({ path }) => path,
+    import_members_csv: () => ({ added: 3, updated: 41, skipped: 1,
+      problems: ['Line 12: enrolment 118 has no name.'] }),
+
     device_diagnose: ({ ip, port }) => ({
       serial: 'GED7253800740', ip, port, mode: 'push',
       tcp_reachable: false, tcp_detail: 'connection timed out',
@@ -799,6 +803,15 @@ export function createDemo() {
         { ts: '2026-08-19 14:21:04', method: 'GET', endpoint: '/iclock/cdata',
           table: '', records: 0, reply: 'handshake' },
       ],
+      probe: {
+        socket_open: true, socket_ms: 0,
+        sent_hex: '50 50 82 7d 08 00 00 00 e8 03 fc ff 00 00 ff ff',
+        received_hex: '', received_bytes: 0,
+        reply_command: null, reply_name: '',
+        error: 'device did not respond in time',
+        verdict: '192.168.100.99:4370 accepted the connection and then went silent. '
+          + 'On a ZKTeco terminal this is what an enabled cloud server (ADMS) looks like.',
+      },
       verdict: 'The terminal sends data but never asks for commands.',
       advice: 'This is the state where punches arrive normally and every download request '
         + 'is ignored forever. Reboot the terminal so it re-reads the server options.',

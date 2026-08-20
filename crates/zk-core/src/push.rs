@@ -75,7 +75,14 @@ pub fn handshake_response(serial: &str, stamp: u64, cfg: &PushConfig) -> String 
         stamp = stamp,
         err = cfg.error_delay_secs,
         delay = cfg.delay_secs,
-        tz = cfg.timezone_hours,
+        // ADMS expects a whole number of hours here. Nepal is UTC+5:45, and
+        // sending "5.75" makes some firmware fail to parse the whole options
+        // block — after which it posts attendance but never enables its command
+        // channel, which is exactly the half-working state that is hardest to
+        // diagnose. The 45 minutes cannot be expressed in this field at all;
+        // punch times come from the device's own clock, so nothing is lost by
+        // rounding it here.
+        tz = cfg.timezone_hours.round() as i32,
         rt = if cfg.realtime { 1 } else { 0 },
     )
 }
@@ -433,6 +440,15 @@ mod tests {
 
 
     #[test]
+    fn the_timezone_is_a_whole_number() {
+        // "TimeZone=5.75" is not a value ADMS understands, and firmware that
+        // cannot parse the options block stops enabling its command channel.
+        let r = handshake_response("SN", 1, &PushConfig::default());
+        assert!(r.contains("TimeZone=6\r\n"), "timezone must be an integer:\n{r}");
+        assert!(!r.contains("5.75"), "a fractional offset reached the device");
+    }
+
+    #[test]
     fn the_handshake_advertises_a_real_adms_server() {
         // Without ServerVer and PushProtVer a K40 Pro posts its attendance log
         // and then never polls for commands. Nothing errors; the command queue
@@ -612,7 +628,7 @@ mod tests {
     fn handshake_contains_required_keys() {
         let r = handshake_response("GED7253800740", 0, &PushConfig::default());
         assert!(r.starts_with("GET OPTION FROM: GED7253800740"));
-        for key in ["Stamp=", "Delay=", "TransFlag=", "TimeZone=5.75", "Realtime=1"] {
+        for key in ["Stamp=", "Delay=", "TransFlag=", "TimeZone=6", "Realtime=1"] {
             assert!(r.contains(key), "handshake missing {key}");
         }
     }

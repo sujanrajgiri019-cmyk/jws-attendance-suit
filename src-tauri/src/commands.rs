@@ -392,6 +392,211 @@ pub struct PullResult {
     pub recomputed: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Staff by spreadsheet
+// ---------------------------------------------------------------------------
+
+/// Export the staff list as a spreadsheet.
+///
+/// The practical reason this exists: staff appear here automatically the first
+/// time they scan, as "Unnamed 41". Reading names off the terminal needs the
+/// device to cooperate, and a terminal in cloud-server mode will not. Exporting
+/// the placeholders, typing the names in Excel and importing them back takes an
+/// office ten minutes and depends on nothing.
+#[tauri::command(async)]
+pub fn export_members_csv(state: State<'_, AppState>, path: String) -> R<String> {
+    let c = conn(&state)?;
+    let mut stmt = c
+        .prepare(
+            "SELECT m.enroll_no, m.full_name, COALESCE(d.name,'') AS dept,
+                    COALESCE(m.designation,'') AS designation,
+                    COALESCE(m.staff_id,'') AS staff_id,
+                    COALESCE(m.mobile,'') AS mobile, COALESCE(m.email,'') AS email,
+                    COALESCE(m.card_no,'') AS card_no, m.privilege, m.status,
+                    COALESCE(m.joined_on,'') AS joined_on
+             FROM members m LEFT JOIN departments d ON d.id = m.dept_id
+             ORDER BY m.enroll_no",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let mut out = String::from(
+        "Enrolment,Name,Department,Designation,StaffID,Mobile,Email,Card,Privilege,Status,Joined\r\n",
+    );
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(format!(
+                "{},{},{},{},{},{},{},{},{},{},{}\r\n",
+                r.get::<_, i64>(0)?,
+                csv_cell(&r.get::<_, String>(1)?),
+                csv_cell(&r.get::<_, String>(2)?),
+                csv_cell(&r.get::<_, String>(3)?),
+                csv_cell(&r.get::<_, String>(4)?),
+                csv_cell(&r.get::<_, String>(5)?),
+                csv_cell(&r.get::<_, String>(6)?),
+                csv_cell(&r.get::<_, String>(7)?),
+                r.get::<_, i64>(8)?,
+                csv_cell(&r.get::<_, String>(9)?),
+                csv_cell(&r.get::<_, String>(10)?),
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        out.push_str(&row.map_err(|e| e.to_string())?);
+    }
+
+    // The byte-order mark is what makes Excel read Nepali names correctly.
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(out.as_bytes());
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&path, bytes).map_err(|e| format!("could not write {path}: {e}"))?;
+    Ok(path)
+}
+
+fn csv_cell(s: &str) -> String {
+    let s = if s.starts_with(['=', '+', '-', '@']) { format!("'{s}") } else { s.to_string() };
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportOutcome {
+    pub added: usize,
+    pub updated: usize,
+    pub skipped: usize,
+    pub problems: Vec<String>,
+}
+
+/// Read a staff spreadsheet back in.
+///
+/// Matched on enrolment number, which is the only thing the terminal and this
+/// database agree on. A row whose enrolment is missing or not a number is
+/// reported rather than guessed at — silently importing half a file is how a
+/// payroll sheet ends up attached to the wrong person.
+#[tauri::command(async)]
+pub fn import_members_csv(state: State<'_, AppState>, path: String) -> R<ImportOutcome> {
+    let raw = std::fs::read(&path).map_err(|e| format!("could not read {path}: {e}"))?;
+    // Tolerate the byte-order mark Excel writes.
+    let text = String::from_utf8_lossy(raw.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(&raw));
+
+    let mut out = ImportOutcome { added: 0, updated: 0, skipped: 0, problems: Vec::new() };
+    let mut c = conn(&state)?;
+    let tx = c.transaction().map_err(|e| e.to_string())?;
+
+    for (n, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f = split_csv(line);
+        // The header row, in whatever case the office saved it.
+        if n == 0 && f.first().map(|s| s.to_lowercase().contains("enrol")).unwrap_or(false) {
+            continue;
+        }
+
+        let Some(enroll) = f.first().and_then(|v| v.trim().parse::<i64>().ok()) else {
+            out.skipped += 1;
+            out.problems.push(format!(
+                "Line {}: '{}' is not an enrolment number.",
+                n + 1,
+                f.first().map(|s| s.as_str()).unwrap_or("")
+            ));
+            continue;
+        };
+        let name = f.get(1).map(|s| s.trim()).unwrap_or("");
+        if name.is_empty() {
+            out.skipped += 1;
+            out.problems.push(format!("Line {}: enrolment {enroll} has no name.", n + 1));
+            continue;
+        }
+
+        let get = |i: usize| f.get(i).map(|s| s.trim().to_string()).unwrap_or_default();
+        let dept = get(2);
+        let dept_id: Option<i64> = if dept.is_empty() {
+            None
+        } else {
+            tx.query_row("SELECT id FROM departments WHERE name = ?1", params![dept], |r| r.get(0))
+                .ok()
+        };
+        if !dept.is_empty() && dept_id.is_none() {
+            out.problems.push(format!(
+                "Line {}: no department called '{dept}' — {name} was imported without one.",
+                n + 1
+            ));
+        }
+
+        let exists: bool = tx
+            .query_row("SELECT 1 FROM members WHERE enroll_no=?1", params![enroll], |_| Ok(true))
+            .unwrap_or(false);
+
+        let r = if exists {
+            tx.execute(
+                "UPDATE members SET full_name=?2,
+                    dept_id = COALESCE(?3, dept_id),
+                    designation = NULLIF(?4,''), staff_id = NULLIF(?5,''),
+                    mobile = NULLIF(?6,''), email = NULLIF(?7,''),
+                    card_no = NULLIF(?8,''),
+                    updated_at = datetime('now','localtime')
+                 WHERE enroll_no = ?1",
+                params![enroll, name, dept_id, get(3), get(4), get(5), get(6), get(7)],
+            )
+        } else {
+            tx.execute(
+                "INSERT INTO members
+                    (enroll_no, full_name, device_name, dept_id, designation, staff_id,
+                     mobile, email, card_no, status)
+                 VALUES (?1,?2,?2,?3,NULLIF(?4,''),NULLIF(?5,''),NULLIF(?6,''),
+                         NULLIF(?7,''),NULLIF(?8,''),'Active')",
+                params![enroll, name, dept_id, get(3), get(4), get(5), get(6), get(7)],
+            )
+        };
+
+        match r {
+            Ok(_) if exists => out.updated += 1,
+            Ok(_) => out.added += 1,
+            Err(e) => {
+                out.skipped += 1;
+                out.problems.push(format!("Line {}: {e}", n + 1));
+            }
+        }
+    }
+
+    let _ = db::audit(
+        &tx,
+        "admin",
+        "members.csv_import",
+        &format!("{} added, {} updated, {} skipped", out.added, out.updated, out.skipped),
+    );
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+/// Split one CSV line, honouring quotes and doubled quotes.
+fn split_csv(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                cur.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(ch),
+        }
+    }
+    out.push(cur);
+    // A leading apostrophe is the one we added on export to defuse a formula.
+    out.into_iter().map(|s| s.trim().trim_start_matches('\'').to_string()).collect()
+}
+
 /// Store a batch of users read from a terminal.
 ///
 /// Never overwrites a name the office has corrected here — the terminal's
@@ -461,6 +666,8 @@ pub struct DeviceDiagnosis {
     pub commands_sent: i64,
     /// The last few exchanges, newest first.
     pub recent: Vec<serde_json::Value>,
+    /// What the SDK protocol actually did, byte for byte.
+    pub probe: pull::Probe,
     /// The one sentence that matters.
     pub verdict: String,
     pub advice: String,
@@ -476,9 +683,18 @@ pub struct DeviceDiagnosis {
 pub fn device_diagnose(state: State<'_, AppState>, ip: String, port: u16) -> R<DeviceDiagnosis> {
     // The socket test happens first, without the database lock held: it can
     // take seconds, and the push listener must stay free to write throughout.
-    let (tcp_reachable, tcp_detail) = match pull::ping(&ip, port, Duration::from_secs(4)) {
-        Ok(ms) => (true, format!("answered in {ms} ms")),
-        Err(e) => (false, e.to_string()),
+    // A plain socket test only proves something accepted the connection. The
+    // probe goes one step further and speaks the protocol, because "the port is
+    // open" and "the terminal talks to us" turned out to be different things.
+    let probe = pull::probe(&ip, port, 0, Duration::from_secs(5));
+    let tcp_reachable = probe.reply_command == Some(zk_core::proto::CMD_ACK_OK)
+        || probe.reply_command == Some(zk_core::proto::CMD_ACK_UNAUTH);
+    let tcp_detail = if probe.socket_open && !tcp_reachable {
+        format!("port open in {} ms but the protocol got no answer", probe.socket_ms)
+    } else if tcp_reachable {
+        format!("answered in {} ms", probe.socket_ms)
+    } else {
+        probe.error.clone().unwrap_or_else(|| "no connection".into())
     };
 
     let listener_running = state.push.lock().map(|g| g.is_some()).unwrap_or(false);
@@ -587,6 +803,20 @@ pub fn device_diagnose(state: State<'_, AppState>, ip: String, port: u16) -> R<D
                  port {listener_port}."
             ),
         )
+    } else if probe.socket_open && !tcp_reachable && cdata_count > 0 {
+        (
+            "The terminal's direct-transfer service is switched off.".to_string(),
+            format!(
+                "Port {port} accepts a connection and then never answers — that is what a \
+                 ZKTeco terminal does when its cloud server (ADMS) is enabled. Punches still \
+                 arrive, but nothing can be read directly.\n\n\
+                 The quickest way to get every user across: on the terminal, go to \
+                 Menu → Comm → Cloud Server / ADMS and switch it off, press Download user \
+                 info here, then switch the cloud server back on. Everything transfers in \
+                 seconds and no punches are lost — the terminal keeps them and re-sends \
+                 when it reconnects."
+            ),
+        )
     } else if cdata_count > 0 && getrequest_count == 0 {
         (
             "The terminal sends data but never asks for commands.".to_string(),
@@ -640,6 +870,7 @@ pub fn device_diagnose(state: State<'_, AppState>, ip: String, port: u16) -> R<D
         commands_pending,
         commands_sent,
         recent,
+        probe,
         verdict,
         advice,
     })
