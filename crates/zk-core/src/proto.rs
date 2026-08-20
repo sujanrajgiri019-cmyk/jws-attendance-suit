@@ -116,21 +116,39 @@ impl Header {
     }
 }
 
-/// Build a complete command payload (header + data) with a valid checksum.
+/// Build a complete command payload (header + data).
 ///
-/// `reply_id` is incremented before framing, matching device expectations.
+/// ## The quirk that matters
+///
+/// The checksum is computed over the packet carrying the reply id **as passed
+/// in**, but the packet that goes on the wire carries that id **plus one**
+/// (folding to zero at `USHRT_MAX`). So the checksum in a valid ZK packet does
+/// not describe the packet's own bytes.
+///
+/// That looks like a mistake and is not one to be corrected. It is what the
+/// reference client does, it is therefore what every shipped terminal has been
+/// tested against, and a device that validates the checksum drops anything
+/// else without a word — which presents as a connection that opens normally and
+/// then never answers. This cost days to find; do not "fix" it.
 pub fn build_payload(command: u16, session_id: u16, reply_id: u16, data: &[u8]) -> Vec<u8> {
-    let next_reply = reply_id.wrapping_add(1);
-
+    // 1. The buffer the checksum is taken over, using the id as given.
     let mut buf = Vec::with_capacity(8 + data.len());
     buf.extend_from_slice(&command.to_le_bytes());
     buf.extend_from_slice(&0u16.to_le_bytes()); // checksum placeholder
     buf.extend_from_slice(&session_id.to_le_bytes());
-    buf.extend_from_slice(&next_reply.to_le_bytes());
+    buf.extend_from_slice(&reply_id.to_le_bytes());
     buf.extend_from_slice(data);
-
     let ck = checksum(&buf);
+
+    // 2. The id that actually goes out. The fold is at USHRT_MAX, not 2^16, so
+    //    65534 becomes 65535 and 65535 becomes 0 — not 65535 then 0 by wrapping.
+    let mut next_reply = reply_id as u32 + 1;
+    if next_reply >= USHRT_MAX {
+        next_reply -= USHRT_MAX;
+    }
+
     buf[2..4].copy_from_slice(&ck.to_le_bytes());
+    buf[6..8].copy_from_slice(&(next_reply as u16).to_le_bytes());
     buf
 }
 
@@ -490,18 +508,97 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_connect_packet_matches_the_reference_client_byte_for_byte() {
+        // These bytes are what the reference Python client sends as its first
+        // packet, and therefore what every ZKTeco terminal in the field has been
+        // tested against. Ours was two fields different — a checksum off by one
+        // and a reply id of 65535 instead of 0 — and the device answered by
+        // saying nothing at all, for days.
+        //
+        // If this test ever fails, the terminal will go silent again.
+        let payload = build_payload(CMD_CONNECT, 0, u16::MAX - 1, &[]);
+        assert_eq!(
+            payload,
+            vec![0xe8, 0x03, 0x17, 0xfc, 0x00, 0x00, 0x00, 0x00],
+            "CMD_CONNECT payload does not match the reference client"
+        );
+
+        let frame = frame_tcp(&payload);
+        assert_eq!(
+            frame,
+            vec![
+                0x50, 0x50, 0x82, 0x7d, // magic
+                0x08, 0x00, 0x00, 0x00, // payload length, not including this header
+                0xe8, 0x03, 0x17, 0xfc, 0x00, 0x00, 0x00, 0x00,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_reply_id_folds_at_ushrt_max_not_at_a_u16_boundary() {
+        let id_of = |sent: u16| -> u16 {
+            let p = build_payload(CMD_CONNECT, 0, sent, &[]);
+            u16::from_le_bytes([p[6], p[7]])
+        };
+        assert_eq!(id_of(0), 1);
+        assert_eq!(id_of(100), 101);
+        assert_eq!(id_of(u16::MAX - 2), u16::MAX - 1);
+        // 65534 + 1 = 65535, which is USHRT_MAX, so it folds to 0 — the step
+        // that a plain wrapping add gets wrong.
+        assert_eq!(id_of(u16::MAX - 1), 0);
+        assert_eq!(id_of(u16::MAX), 1);
+    }
+
+    #[test]
+    fn the_checksum_describes_the_id_passed_in_not_the_one_sent() {
+        // Deliberately pinned: correcting this "inconsistency" is what broke it.
+        let payload = build_payload(CMD_CONNECT, 0, 500, &[]);
+        let sent_id = u16::from_le_bytes([payload[6], payload[7]]);
+        assert_eq!(sent_id, 501);
+
+        let mut as_checksummed = payload.clone();
+        as_checksummed[2..4].copy_from_slice(&0u16.to_le_bytes());
+        as_checksummed[6..8].copy_from_slice(&500u16.to_le_bytes());
+        assert_eq!(
+            u16::from_le_bytes([payload[2], payload[3]]),
+            checksum(&as_checksummed),
+            "the checksum must be taken over the pre-increment buffer"
+        );
+    }
+
+    #[test]
+    fn a_command_with_data_still_matches_the_reference_shape() {
+        // The data is included in the checksum, and the header stays 8 bytes.
+        let data = b"hello";
+        let p = build_payload(CMD_CONNECT, 7, 3, data);
+        assert_eq!(p.len(), 8 + data.len());
+        assert_eq!(&p[8..], data);
+        assert_eq!(u16::from_le_bytes([p[4], p[5]]), 7, "session id");
+        assert_eq!(u16::from_le_bytes([p[6], p[7]]), 4, "reply id incremented");
+
+        let mut check_buf = p.clone();
+        check_buf[2..4].copy_from_slice(&0u16.to_le_bytes());
+        check_buf[6..8].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(u16::from_le_bytes([p[2], p[3]]), checksum(&check_buf));
+    }
+
+    #[test]
     fn checksum_is_stable_and_folds() {
-        // A packet whose checksum field is zeroed must produce a value that,
-        // once written back, makes the whole buffer verify consistently.
+        // This test used to assert that the checksum verifies over the packet
+        // as sent, and that 65534 becomes 65535. Both were wrong, and pinning
+        // them is what kept a real terminal silent: the device dropped every
+        // packet we sent and never said why. See the byte-for-byte test above
+        // for what a correct packet looks like.
         let payload = build_payload(CMD_CONNECT, 0, 65534, &[]);
         let h = Header::parse(&payload).unwrap();
         assert_eq!(h.command, CMD_CONNECT);
         assert_eq!(h.session_id, 0);
-        assert_eq!(h.reply_id, 65535, "reply id must be incremented before send");
+        assert_eq!(h.reply_id, 0, "65534 + 1 folds to 0 at USHRT_MAX");
 
-        // Recomputing over the buffer with the checksum zeroed reproduces it.
+        // The checksum describes the buffer *before* the id was advanced.
         let mut z = payload.clone();
         z[2..4].copy_from_slice(&0u16.to_le_bytes());
+        z[6..8].copy_from_slice(&65534u16.to_le_bytes());
         assert_eq!(checksum(&z), h.checksum);
     }
 
@@ -517,8 +614,11 @@ mod tests {
 
     #[test]
     fn reply_id_wraps_without_panicking() {
+        // The fold is at USHRT_MAX rather than at the u16 boundary, so the top
+        // value goes to 1 and not to 0. Arithmetic is done in u32 so this can
+        // never overflow whatever the device sends back.
         let p = build_payload(CMD_EXIT, 7, u16::MAX, &[]);
-        assert_eq!(Header::parse(&p).unwrap().reply_id, 0);
+        assert_eq!(Header::parse(&p).unwrap().reply_id, 1);
     }
 
     #[test]

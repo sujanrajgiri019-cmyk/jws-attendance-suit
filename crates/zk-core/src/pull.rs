@@ -76,12 +76,20 @@ impl Device {
     }
 
     /// Send a command and read one reply.
+    ///
+    /// The next reply id comes from the device's answer rather than from a
+    /// counter kept here. Terminals do not always echo the id they were sent,
+    /// and following their lead is what the reference client does — drifting
+    /// out of step with the device makes it stop answering partway through a
+    /// transfer, which reads as a random timeout.
     fn command(&mut self, cmd: u16, data: &[u8]) -> Result<(Header, Vec<u8>)> {
         let payload = proto::build_payload(cmd, self.session_id, self.reply_id, data);
-        self.reply_id = self.reply_id.wrapping_add(1);
         self.stream.write_all(&proto::frame_tcp(&payload))?;
         self.stream.flush()?;
-        self.read_reply()
+
+        let (header, body) = self.read_reply()?;
+        self.reply_id = header.reply_id;
+        Ok((header, body))
     }
 
     /// Read one framed reply: 8-byte TCP prefix, then exactly that many bytes.
@@ -432,7 +440,8 @@ pub fn probe(addr: &str, port: u16, comm_key: u32, timeout: Duration) -> Probe {
     let _ = stream.set_write_timeout(Some(timeout));
     let _ = stream.set_nodelay(true);
 
-    // One CMD_CONNECT, framed exactly as a live session would send it.
+    // One CMD_CONNECT, framed exactly as a live session would send it —
+    // the reference client's first packet, byte for byte.
     let payload = proto::build_payload(proto::CMD_CONNECT, 0, u16::MAX - 1, &[]);
     let frame = proto::frame_tcp(&payload);
     p.sent_hex = hex(&frame);
