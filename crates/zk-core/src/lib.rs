@@ -6,8 +6,11 @@
 //! including on a build machine with no access to the school's terminal.
 
 pub mod auth;
+pub mod biosync;
 pub mod calendar;
 pub mod db;
+pub mod fptemp;
+pub mod keystore;
 pub mod proto;
 pub mod pull;
 pub mod push;

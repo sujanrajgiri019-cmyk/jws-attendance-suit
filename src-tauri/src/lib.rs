@@ -1,5 +1,6 @@
 //! JWS Attendance — application wiring.
 
+mod bio_commands;
 mod commands;
 mod reporting;
 mod scheduling;
@@ -68,6 +69,12 @@ pub fn run() {
                 reset: Mutex::new(None),
                 started: std::time::Instant::now(),
             });
+
+            // Seal any fingerprint templates a build from before migration 005
+            // left stored as plain base64. Logged, never fatal — an unsealed
+            // template still works, and refusing to open the app over one would
+            // be worse than the exposure it guards against.
+            bio_commands::seal_legacy_on_start(&handle, &db);
 
             // Bring today's attendance up to date on launch, so opening the app
             // after a weekend shows the right picture immediately.
@@ -142,6 +149,11 @@ pub fn run() {
             commands::device_download_logs,
             commands::device_download_users,
             commands::device_upload_users,
+            // --- Users and fingerprint templates over TCP 4370 --------------
+            bio_commands::device_download_biometrics,
+            bio_commands::device_upload_biometrics,
+            bio_commands::bio_sync_history,
+            bio_commands::bio_key_status,
             commands::push_start,
             commands::push_stop,
             commands::local_addresses,

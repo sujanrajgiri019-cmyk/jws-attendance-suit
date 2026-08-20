@@ -1,0 +1,56 @@
+# Compile and test on every push.
+#
+# Separate from release.yml on purpose. That one fires only on a `v*` tag and
+# publishes an installer the school's computer will offer to install; this one
+# fires on any branch, publishes nothing, and exists to answer one question:
+# does it build?
+#
+# Worth having because the machine this project is developed on is also the
+# machine the school uses, and a full `npm run package` there costs 15-30
+# minutes before it will tell you about a missing semicolon. A GitHub runner
+# says the same thing in a few minutes and does not tie up the office PC.
+
+name: Check
+
+on:
+  push:
+    branches: ['**']     # any branch; tags are handled by release.yml
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: Compile and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # Tauri needs these to build on Linux. The core crate does not, but the
+      # workspace is checked as a whole so the desktop layer is covered too.
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev
+
+      - run: npm ci
+
+      # `--all-targets` includes the test modules. Without it a broken test
+      # compiles nowhere and is only discovered when someone runs the suite.
+      - name: Compile everything, tests included
+        run: cargo check --workspace --all-targets
+
+      - name: Core tests
+        run: cargo test --workspace
+
+      - name: Frontend tests
+        run: npm test
+
+      - name: Frontend build
+        run: npm run build

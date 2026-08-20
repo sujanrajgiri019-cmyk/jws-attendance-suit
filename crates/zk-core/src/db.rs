@@ -16,6 +16,7 @@ static MIGRATIONS: &[(&str, &str)] = &[
     ("002_seed", include_str!("../migrations/002_seed.sql")),
     ("003_scheduling", include_str!("../migrations/003_scheduling.sql")),
     ("004_device_log", include_str!("../migrations/004_device_log.sql")),
+    ("005_biometrics", include_str!("../migrations/005_biometrics.sql")),
 ];
 
 /// Open (creating if needed) the attendance database and bring it up to date.

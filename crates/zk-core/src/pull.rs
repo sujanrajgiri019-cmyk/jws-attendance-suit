@@ -82,7 +82,12 @@ impl Device {
     /// and following their lead is what the reference client does — drifting
     /// out of step with the device makes it stop answering partway through a
     /// transfer, which reads as a random timeout.
-    fn command(&mut self, cmd: u16, data: &[u8]) -> Result<(Header, Vec<u8>)> {
+    ///
+    /// Visible to the crate so `biosync` can run a whole transfer under one
+    /// device lock. The public methods on this type each take and release that
+    /// lock themselves, which is right for a single operation and wrong for a
+    /// batch of two hundred.
+    pub(crate) fn command(&mut self, cmd: u16, data: &[u8]) -> Result<(Header, Vec<u8>)> {
         let payload = proto::build_payload(cmd, self.session_id, self.reply_id, data);
         self.stream.write_all(&proto::frame_tcp(&payload))?;
         self.stream.flush()?;
@@ -126,7 +131,7 @@ impl Device {
     ///
     /// Terminals answer either inline (`CMD_DATA`) or by announcing a size with
     /// `CMD_PREPARE_DATA` and then streaming raw bytes. Both are handled.
-    fn read_bulk(&mut self, cmd: u16, data: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn read_bulk(&mut self, cmd: u16, data: &[u8]) -> Result<Vec<u8>> {
         let (header, body) = self.command(cmd, data)?;
 
         match header.command {
@@ -193,7 +198,7 @@ impl Device {
     /// it has to be staged into a buffer with `CMD_DATA_WRRQ` and then pulled
     /// out in chunks. Small tables come back inline in the first reply, so both
     /// paths are handled.
-    fn read_with_buffer(&mut self, table_cmd: u16, fct: i32) -> Result<Vec<u8>> {
+    pub(crate) fn read_with_buffer(&mut self, table_cmd: u16, fct: i32) -> Result<Vec<u8>> {
         const MAX_CHUNK: u32 = 0xFF_C0; // what the devices accept over TCP
 
         let request = proto::build_wrrq_request(table_cmd, fct, 0);
