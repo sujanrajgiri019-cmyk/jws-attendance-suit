@@ -111,8 +111,6 @@ async function blocksTab(host) {
       </div>
 
       <div class="sec-lbl">Valid check-in window</div>
-      <p class="hint mb8">Any scan inside this window is an arrival. This is what stops a
-        lunchtime scan being read as the day's check-out.</p>
       <div class="grid2">
         ${f('in_begin', 'Beginning in')}
         ${f('in_end', 'Ending in')}
@@ -133,7 +131,6 @@ async function blocksTab(host) {
         ${f('workday_value', 'Workday value', 'number', 'min="0" max="2" step="0.25"')}
         ${f('work_minutes', 'Custom paid minutes', 'number', 'min="0" max="1440"')}
       </div>
-      <p class="hint">Leave custom paid minutes at 0 to use the on-duty to off-duty span.</p>
 
       <div class="sec-lbl">Rules</div>
       <label class="cb"><input type="checkbox" name="must_c_in" ${t.must_c_in ? 'checked' : ''}>
@@ -399,10 +396,7 @@ async function shiftsTab(host) {
         </div>
         <label class="cb"><input type="checkbox" name="active" ${s.active ? 'checked' : ''}>
           <div class="ct"><b>In use</b><span>Switch off to retire it without deleting</span></div></label>
-        <div class="note b">${icon('info')}<div>
-          The beginning date only matters for a cycle longer than one unit — it
-          decides which week of the cycle any given date falls in.
-        </div></div>`,
+`,
       onMount: (ov) => wireDateFields(ov),
       buttons: [
         { label: 'Cancel', value: null },
@@ -474,10 +468,7 @@ async function shiftsTab(host) {
               ${timetables.map((t) =>
                 `<option value="${t.id}">${esc(t.name)} · ${esc(hhmm(t.on_duty))}–${esc(hhmm(t.off_duty))}</option>`).join('')}
             </select></div>
-          <div class="note b">${icon('info')}<div>
-            A day can hold more than one block — a split morning and evening duty
-            is two of them.
-          </div></div>`,
+`,
         buttons: [
           { label: 'Cancel', value: null },
           {
@@ -711,11 +702,7 @@ async function rosterTab(host) {
           ${dateField('end', `To${isTemporary ? '' : ' (optional)'}`,
             isTemporary ? addDays(todayIso(), 6) : '')}
         </div>
-        <div class="note ${isTemporary ? 'v' : 'b'}">${icon('info')}<div>${
-          isTemporary
-            ? 'A temporary arrangement overrides the standing shift for these dates only. The contract underneath is left alone.'
-            : 'The previous assignment is closed off today and a new one opened, so recomputing last month still finds the shift they were actually on.'
-        }</div></div>`,
+`,
       onMount: (ov) => wireDateFields(ov),
       buttons: [
         { label: 'Cancel', value: null },

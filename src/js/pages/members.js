@@ -1,7 +1,7 @@
 import { api } from '../api.js';
 import {
   icon, esc, table, person, modal, toast, withBusy, confirmDialog,
-  loadingTable, readForm,
+  loadingTable, readForm, todayIso,
 } from '../ui.js';
 import { dateField, wireDateFields } from '../nepali.js';
 
@@ -33,7 +33,8 @@ export default {
           <option>Active</option><option>Inactive</option><option>On Leave</option>
         </select>
         <div class="sp"></div>
-        <button class="btn" id="btnExport">${icon('file')} Export CSV</button>
+        <button class="btn" id="btnExport">${icon('down')} Export CSV</button>
+        <button class="btn" id="btnImport">${icon('up')} Bulk upload</button>
         <button class="btn pri" id="btnAdd">${icon('plus')} Add member</button>
       </div>
 
@@ -226,6 +227,62 @@ export default {
       toast('ok', `${selected.size} deleted`);
       selected.clear();
       await load();
+    });
+
+    // Bulk upload: the same file the export writes, filled in and handed back.
+    // Matched on enrolment number, so a row can never land on the wrong person.
+    host.querySelector('#btnImport').addEventListener('click', async () => {
+      const path = await modal({
+        title: 'Bulk upload staff',
+        subtitle: 'A spreadsheet saved as CSV',
+        body: `<div class="fld"><label>File name or full path</label>
+            <input class="inp" name="p" value="staff-list-${todayIso()}.csv"
+                   placeholder="D:\\Reports\\staff.csv"></div>
+          <div class="note b">${icon('info')}<div>
+            Columns: <b>Enrolment</b>, <b>Name</b>, then Department, Designation, StaffID,
+            Mobile, Email, Card. Only the first two are required. Save from Excel as
+            <b>CSV UTF-8</b> so Nepali names survive.
+          </div></div>
+          <div class="fld" style="margin-top:12px">
+            <button class="btn sm" id="tplOut">${icon('down')} Download a template first</button>
+          </div>`,
+        onMount: (ov) => {
+          ov.querySelector('#tplOut').addEventListener('click', async (e) => {
+            e.preventDefault();
+            const p = await api.exportMembersCsv(ov.querySelector('[name=p]').value.trim()
+              || `staff-list-${todayIso()}.csv`);
+            await api.openPath(p).catch(() => {});
+            toast('ok', `Template written to ${p}`);
+          });
+        },
+        buttons: [
+          { label: 'Cancel', value: null },
+          { label: 'Upload', kind: 'pri',
+            onClick: (ov) => ov.querySelector('[name=p]').value.trim() },
+        ],
+      });
+      if (!path) return;
+
+      try {
+        const r = await api.importMembersCsv(path);
+        await load();
+        const msg = `${r.added} added, ${r.updated} updated${
+          r.skipped ? `, ${r.skipped} skipped` : ''}`;
+        if (r.problems.length) {
+          await modal({
+            title: 'Upload finished',
+            subtitle: msg,
+            body: `<div class="console" style="height:220px">${
+              r.problems.map((x) => `<div class="ln"><span class="warn">${esc(x)}</span></div>`).join('')
+            }</div>`,
+            buttons: [{ label: 'Close', value: null }],
+          });
+        } else {
+          toast('ok', msg);
+        }
+      } catch (e) {
+        toast('err', e.message || String(e));
+      }
     });
 
     host.querySelector('#btnExport').addEventListener('click', () => {

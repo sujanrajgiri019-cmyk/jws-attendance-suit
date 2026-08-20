@@ -145,10 +145,7 @@ function calcTab() {
     ${card('Grace periods', 'How much lateness is overlooked', `
       ${num('late_after_min', 'Clock-in over', 'minutes past on duty counts as late')}
       ${num('early_after_min', 'Clock-out over', 'minutes before off duty counts as early')}
-      <div class="note b">${icon('info')}<div>
-        A timetable that sets its own grace overrides these. These fill in for
-        timetables that leave it at zero.
-      </div></div>`)}
+`)}
 
     ${card('Missing punches', 'When only one scan was recorded', `
       ${check('no_clock_in_enabled', 'Handle a missing clock-in', 'Otherwise the day is graded on what is there')}
@@ -172,10 +169,7 @@ function calcTab() {
       ${num('late_to_absent_min', 'As late exceeds', 'minutes, count as absent')}
       ${check('early_to_absent_enabled', 'Early leave beyond a limit counts as absent')}
       ${num('early_to_absent_min', 'As early leave exceeds', 'minutes, count as absent')}
-      <div class="note y">${icon('warn')}<div>
-        These have to run in order — half day before absent — or nobody is ever
-        recorded as a half day. The app will refuse a set that grades backwards.
-      </div></div>`)}
+`)}
 
     ${card('Overtime triggers', 'What earns overtime', `
       ${check('ot_after_shift_enabled', 'Staying past off duty counts as OT')}

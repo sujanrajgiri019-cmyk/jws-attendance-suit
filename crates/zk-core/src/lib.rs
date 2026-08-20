@@ -27,7 +27,15 @@ pub enum Error {
     #[error("device did not respond in time")]
     Timeout,
 
-    #[error("device refused the command (comm key wrong?)")]
+    #[error(
+        "The terminal answered, but refused the connection because a communication key \
+         is set on it.\n\n\
+         Find it on the device under Menu → Comm → Security → COMM Key (some firmware \
+         calls it Comm Password), then enter that number in the COMM key box on the \
+         Devices screen and try again.\n\n\
+         If the device shows 0 there, set it to a number, save, and enter the same number \
+         here — some firmware refuses a key of zero once security has been switched on."
+    )]
     Unauthorised,
 
     #[error("network error: {0}")]

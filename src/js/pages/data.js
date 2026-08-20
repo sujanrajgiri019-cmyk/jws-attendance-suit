@@ -20,34 +20,6 @@ const ACTIONS = [
   { id: 'diagnose', label: 'Diagnose connection', icon: 'plug' },
 ];
 
-/** What each job actually does, in the office's terms rather than the protocol's. */
-const EXPLAIN = {
-  logs: {
-    title: 'Download attendance logs',
-    lead: 'Fetches every check-in and check-out the terminal has stored, so the '
-      + 'attendance report can be calculated from them.',
-    detail: 'Records already held here are skipped, so this is safe to run as often as '
-      + 'you like. Anything new is added and the affected days are recalculated '
-      + 'straight away — the reports are correct the moment this finishes.',
-  },
-  users_down: {
-    title: 'Download user info and fingerprints',
-    lead: 'Brings every person enrolled on the terminal into this software — their '
-      + 'enrolment number, name, card number, privilege level and fingerprint templates.',
-    detail: 'They appear on the Members screen as soon as this finishes. Names already '
-      + 'corrected here are never overwritten by the terminal\'s 24-character version; '
-      + 'only new people are added and only blank fields are filled in.',
-  },
-  users_up: {
-    title: 'Upload user info and fingerprints',
-    lead: 'Sends staff from this software to the terminal, so somebody added here can '
-      + 'scan at the gate without being enrolled on the device by hand.',
-    detail: 'Their name, enrolment number, card and privilege go across. Fingerprints '
-      + 'have to be enrolled at the terminal itself the first time — but once they are '
-      + 'downloaded here, this puts them back on a replacement device.',
-  },
-};
-
 export default {
   async mount(host) {
     const [devices, members, depts] = await Promise.all([
@@ -219,28 +191,20 @@ export default {
       if (action === 'sheet') {
         body.innerHTML = `
           <div class="form-head"><h3>Staff by spreadsheet</h3></div>
-          <p class="lead">Names every person the terminal has seen, without needing the
-            terminal to cooperate.</p>
-          <p class="hint mb8">Staff appear here automatically the first time they scan, as
-            "Unnamed 41". Export that list, type the real names beside the enrolment numbers
-            in Excel, and import it back. Rows are matched on enrolment number, so nothing
-            can attach to the wrong person.</p>
+          <p class="hint mb8">Export the list, type names in Excel, import it back.
+            Matched on enrolment number.</p>
           <div class="grid2">
             <button class="btn" id="csvOut">${icon('down')} Export staff list</button>
             <button class="btn pri" id="csvIn">${icon('up')} Import filled-in list</button>
           </div>
-          <div class="note b" style="margin-top:14px">${icon('info')}<div>
-            Only the <b>Enrolment</b> and <b>Name</b> columns are required. Department must
-            match one that already exists, or it is left unset and reported.
-          </div></div>`;
+`;
         return;
       }
 
       if (action === 'diagnose') {
         body.innerHTML = `
           <div class="form-head"><h3>Diagnose connection</h3></div>
-          <p class="hint mb8">Checks what the terminal is actually doing, rather than what
-            it should be doing, and says which of the handful of causes is the real one.</p>
+          <p class="hint mb8">Checks what the terminal is really doing and names the cause.</p>
           <button class="btn pri" id="go">${icon('plug')} Run diagnosis</button>
           <div id="diagOut"></div>`;
         return;
@@ -248,35 +212,28 @@ export default {
 
       if (action === 'logs') {
         body.innerHTML = `
-          <div class="form-head"><h3>${esc(EXPLAIN.logs.title)}</h3></div>
-          <p class="lead">${esc(EXPLAIN.logs.lead)}</p>
-          <p class="hint mb8">${esc(EXPLAIN.logs.detail)}</p>
-          <div class="note b" id="modeNote">${icon('info')}<div></div></div>
+          <div class="form-head"><h3>Download attendance logs</h3></div>
+          <p class="hint mb8">Records already held are skipped. Safe to run at any time.</p>
           <label class="cb"><input type="checkbox" id="clearAfter">
             <div class="ct"><b>Clear the terminal log afterwards</b>
               <span>Frees memory on the device. Only happens if the transfer succeeds,
                 and it cannot be undone.</span></div></label>
           <button class="btn pri" id="go">${icon('down')} Download logs</button>`;
-        paintModeNote();
-        return;
+          return;
       }
 
       if (action === 'users_down') {
         body.innerHTML = `
-          <div class="form-head"><h3>${esc(EXPLAIN.users_down.title)}</h3></div>
-          <p class="lead">${esc(EXPLAIN.users_down.lead)}</p>
-          <p class="hint mb8">${esc(EXPLAIN.users_down.detail)}</p>
-          <div class="note b" id="modeNote">${icon('info')}<div></div></div>
+          <div class="form-head"><h3>Download user info and FP</h3></div>
+          <p class="hint mb8">Names, enrolment numbers and fingerprints, into Members.</p>
           <button class="btn pri" id="go">${icon('users')} Read users from terminal</button>`;
-        paintModeNote();
-        return;
+          return;
       }
 
       if (action === 'users_up') {
         body.innerHTML = `
-          <div class="form-head"><h3>${esc(EXPLAIN.users_up.title)}</h3></div>
-          <p class="lead">${esc(EXPLAIN.users_up.lead)}</p>
-          <p class="hint mb8">${esc(EXPLAIN.users_up.detail)}</p>
+          <div class="form-head"><h3>Upload user info and FP</h3></div>
+          <p class="hint mb8">Send staff from here to the terminal.</p>
           <div class="fld"><label>Who to send</label>
             <div class="radios">
               <label class="rd"><input type="radio" name="scope" value="all" checked><span>Everyone</span></label>
@@ -293,11 +250,7 @@ export default {
         body.innerHTML = `
           <div class="form-head"><h3>Attendance photo management</h3></div>
           <div class="note y">${icon('warn')}<div>
-            <b>The K40 Pro does not capture attendance photos.</b><br>
-            This screen is here for a terminal that does. Photos would be stored
-            beside the database rather than inside it — a year of captures is
-            several gigabytes, and that does not belong in a file the office
-            copies to a memory stick.
+            The K40 Pro does not capture attendance photos.
           </div></div>
           <button class="btn" id="go" disabled>${icon('file')} Download photos</button>`;
         return;
@@ -306,44 +259,22 @@ export default {
       if (action === 'ac') {
         body.innerHTML = `
           <div class="form-head"><h3>Access control</h3></div>
-          <p class="hint mb8">Time zones say when the door relay may open; a group binds up
-            to three of them and is what each member of staff belongs to.</p>
-          <div class="note b">${icon('info')}<div>
-            Two time zones and two groups are set up: <b>Always open</b> and
-            <b>School hours</b> (06:00–19:00, closed Saturday). Members are in
-            group 1 unless changed on their record.
-          </div></div>
+          <p class="hint mb8">Time zones control when the door relay may open.</p>
           <div class="note y">${icon('warn')}<div>
-            Pushing access rules to the relay is not enabled in this version. The
-            definitions are stored and will be sent once the door hardware is
-            wired to the terminal.
+            Pushing access rules to the relay needs door hardware wired to the terminal.
           </div></div>`;
         return;
       }
 
-      paintModeNote();
       body.innerHTML = `
         <div class="form-head"><h3>Recalculate attendance</h3></div>
-        <p class="hint mb8">Run this after changing shifts, timetables, holidays or rules.
-          Days an administrator corrected by hand, and any locked month, are left untouched.</p>
+        <p class="hint mb8">Run after changing shifts, timetables, holidays or rules.
+          Hand-corrected and locked days are left alone.</p>
         <div class="grid2">
           ${dateField('recFrom', 'From', monthStart(todayIso()), { id: 'recFrom' })}
           ${dateField('recTo', 'To', todayIso(), { id: 'recTo' })}
         </div>
         <button class="btn pri" id="go">${icon('sync')} Recalculate</button>`;
-    }
-
-    /** Say which way round this terminal talks, because it changes what happens. */
-    function paintModeNote() {
-      const note = body.querySelector('#modeNote div');
-      if (!note) return;
-      note.innerHTML = device?.mode === 'push'
-        ? `<b>${esc(device.name)} is in push mode.</b> It reports to this PC rather than
-           being dialled, so this asks the terminal to send everything and then waits for
-           it to arrive — usually a few seconds, up to two minutes if the terminal has a
-           long check-in interval. Progress appears in the console below.`
-        : 'This dials the terminal directly on port 4370. A full terminal takes up to a '
-          + 'minute; the app stays usable while it works.';
     }
 
     function wireScope() {
@@ -525,8 +456,6 @@ export default {
         ${row('Mode', esc(d.mode))}
 
         <div class="sec-lbl">Direct connection probe</div>
-        <p class="hint mb8">A socket opening is not the same as the terminal talking to us.
-          This sends one real protocol packet and shows what came back.</p>
         ${row('Socket opened', ok(d.probe.socket_open)
           + (d.probe.socket_open ? ` <span class="dim">${d.probe.socket_ms} ms</span>` : ''))}
         ${row('Bytes sent', `<span class="mono" style="font-size:10.5px">${

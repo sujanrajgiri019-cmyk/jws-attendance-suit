@@ -528,15 +528,18 @@ test('a fractional stepper does not produce floating point noise', async ({ page
 // Data Transfer
 // ---------------------------------------------------------------------------
 
-test('each transfer job explains what it actually does', async ({ page }) => {
+test('each transfer job names itself and stays brief', async ({ page }) => {
   await page.click('#nav a[data-page="data"]');
-  for (const [act, phrase] of [
-    ['logs', 'check-in and check-out'],
-    ['users_down', 'enrolled on the terminal'],
-    ['users_up', 'from this software to the terminal'],
+  for (const [act, title] of [
+    ['logs', 'Download attendance logs'],
+    ['users_down', 'Download user info and FP'],
+    ['users_up', 'Upload user info and FP'],
   ]) {
     await page.click(`#actNav [data-act="${act}"]`);
-    await expect(page.locator('#actBody .lead')).toContainText(phrase);
+    await expect(page.locator('#actBody .form-head h3')).toHaveText(title);
+    // A pane of explanatory paragraphs is what made this screen feel cluttered.
+    const words = (await page.locator('#actBody').innerText()).split(/\s+/).length;
+    expect(words, `${act} pane is wordy`).toBeLessThan(90);
   }
 });
 
@@ -576,7 +579,7 @@ test('diagnose shows the protocol probe, not just a socket test', async ({ page 
 test('the spreadsheet route offers export and import', async ({ page }) => {
   await page.click('#nav a[data-page="data"]');
   await page.click('#actNav [data-act="sheet"]');
-  await expect(page.locator('#actBody .lead')).toContainText('without needing the terminal');
+  await expect(page.locator('#actBody .form-head h3')).toHaveText('Staff by spreadsheet');
   await expect(page.locator('#csvOut')).toBeVisible();
   await expect(page.locator('#csvIn')).toBeVisible();
 });
@@ -589,4 +592,22 @@ test('importing a staff list reports what happened to every row', async ({ page 
   await expect(page.locator('#console')).toContainText('41 updated');
   // Problems are surfaced, not swallowed.
   await expect(page.locator('#console')).toContainText('has no name');
+});
+
+
+test('members has bulk upload beside export', async ({ page }) => {
+  await page.click('#nav a[data-page="members"]');
+  await expect(page.locator('#btnExport')).toBeVisible();
+  await expect(page.locator('#btnImport')).toContainText('Bulk upload');
+});
+
+test('bulk upload reports every row it could not use', async ({ page }) => {
+  await page.click('#nav a[data-page="members"]');
+  await page.click('#btnImport');
+  await expect(page.locator('.mdl')).toContainText('Bulk upload staff');
+  await page.locator('.mdl .btn.pri').click();
+  // Problems open in their own panel rather than vanishing into a toast.
+  await expect(page.locator('.mdl')).toContainText('Upload finished');
+  await expect(page.locator('.mdl')).toContainText('41 updated');
+  await expect(page.locator('.mdl .console')).toContainText('has no name');
 });

@@ -508,6 +508,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_auth_token_matches_the_reference_client() {
+        // Generated from the reference Python client. If these drift, a
+        // terminal with a communication key set will reject every connection
+        // with "unauthorised" and no further explanation.
+        let cases: [(u32, u16, [u8; 4]); 6] = [
+            (0, 0, [97, 125, 90, 121]),
+            (0, 1234, [97, 125, 136, 125]),
+            (0, 65535, [97, 125, 165, 134]),
+            (1, 500, [97, 253, 174, 120]),
+            (123456, 4321, [38, 127, 187, 233]),
+            (999999, 17, [35, 129, 75, 137]),
+        ];
+        for (key, session, expected) in cases {
+            assert_eq!(
+                make_comm_key(key, session, 50),
+                expected,
+                "comm key {key} with session {session}"
+            );
+        }
+    }
+
+    #[test]
     fn a_connect_packet_matches_the_reference_client_byte_for_byte() {
         // These bytes are what the reference Python client sends as its first
         // packet, and therefore what every ZKTeco terminal in the field has been

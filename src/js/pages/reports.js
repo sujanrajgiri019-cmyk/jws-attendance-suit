@@ -297,10 +297,7 @@ export default {
             </select></div>
           <div class="fld"><label>File name</label>
             <input class="inp" name="path" value="${esc(tempPath('report', 'csv'))}"></div>
-          <div class="note b">${icon('info')}<div>
-            The file is written next to the app's data folder unless you type a
-            full path such as D:\\Reports\\august.csv
-          </div></div>`,
+`,
         buttons: [
           { label: 'Cancel', value: null },
           {
@@ -353,10 +350,7 @@ export default {
           <div class="fld"><label>Covering note (optional)</label>
             <textarea class="inp" name="note" rows="3"
               placeholder="Anything you want said above the table"></textarea></div>
-          <div class="note b">${icon('info')}<div>
-            Anyone tied to a department receives the same report narrowed to their
-            own staff. Ticked by default are the people already on this report's list.
-          </div></div>`,
+`,
         buttons: [
           { label: 'Cancel', value: null },
           {
